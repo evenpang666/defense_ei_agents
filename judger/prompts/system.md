@@ -8,6 +8,8 @@ You receive:
   `phase_01_<phase_description>_global_rgb.png` and
   `phase_01_<phase_description>_wrist_rgb.png`,
 - only the current phase's global/wrist RGB images.
+- optionally, `scene_state_brief` with approximate post-execution RGB-D object
+  or grasp-region distances in base/gripper coordinates.
 
 Camera image roles:
 - `global_image` is the global camera view of the whole scene.
@@ -30,6 +32,9 @@ phase, return `SUCCESS` only if the whole atomic task is complete.
 
 The supplied validation images have been proportionally resized to width 128 px,
 so avoid overclaiming details that are not visible at that scale.
+When `scene_state_brief` is present, use it as supporting evidence for distance
+change, object motion, and gripper/object alignment. Do not let a low-confidence
+or missing depth estimate override clear visual evidence.
 
 Output one JSON object only:
 `{"task_result": "SUCCESS" | "FAIL", "analysis": "..."}`

@@ -42,6 +42,13 @@ for defense_agent_root in (
         _prepend_sys_path(defense_agent_root.resolve())
 
 from ur7e_controller import ROBOT_IP, UR7eVectorController, make_real_runtime_api  # noqa: E402
+from scene_perception import (  # noqa: E402
+    RGBDFrame,
+    build_scene_state,
+    gripper_to_wrist_camera_transform,
+    load_transform,
+    scene_state_brief,
+)
 
 
 DEFAULT_PROFILE_ROOT = PROJECT_ROOT
@@ -205,6 +212,8 @@ class RealSenseRGBPair:
         self._fps = int(fps)
         self._warmup_frames = max(0, int(warmup_frames))
         self._pipelines: list[Any] = []
+        self._profiles: list[Any] = []
+        self._align_to_color = self._rs.align(self._rs.stream.color)
 
     def __enter__(self) -> "RealSenseRGBPair":
         placeholders = [
@@ -241,8 +250,15 @@ class RealSenseRGBPair:
                 self._rs.format.rgb8,
                 self._fps,
             )
+            cfg.enable_stream(
+                self._rs.stream.depth,
+                self._width,
+                self._height,
+                self._rs.format.z16,
+                self._fps,
+            )
             try:
-                pipeline.start(cfg)
+                profile = pipeline.start(cfg)
             except RuntimeError as exc:
                 detected = self._describe_devices()
                 raise RuntimeError(
@@ -252,6 +268,7 @@ class RealSenseRGBPair:
                     "with real camera serial numbers or omit --camera-serials to auto-discover."
                 ) from exc
             self._pipelines.append(pipeline)
+            self._profiles.append(profile)
 
         for _ in range(self._warmup_frames):
             self.capture()
@@ -264,6 +281,7 @@ class RealSenseRGBPair:
             except Exception:
                 pass
         self._pipelines.clear()
+        self._profiles.clear()
 
     def _discover_serials(self) -> list[str]:
         ctx = self._rs.context()
@@ -302,19 +320,60 @@ class RealSenseRGBPair:
         return ", ".join(devices)
 
     def capture(self) -> tuple[Any, Any]:
+        global_frame, wrist_frame = self.capture_rgbd()
+        return global_frame.color, wrist_frame.color
+
+    def capture_rgbd(self) -> tuple[RGBDFrame, RGBDFrame]:
         if not self._pipelines:
             raise RuntimeError("RealSense pipelines are not started.")
 
-        images: list[Any] = []
-        for pipeline in self._pipelines:
-            frames = pipeline.wait_for_frames()
+        frames_out: list[RGBDFrame] = []
+        for idx, pipeline in enumerate(self._pipelines):
+            frames = self._align_to_color.process(pipeline.wait_for_frames())
             color = frames.get_color_frame()
-            if not color:
-                raise RuntimeError("Failed to read a RealSense RGB frame.")
-            images.append(self._np.asarray(color.get_data(), dtype=self._np.uint8).copy())
-        if len(images) == 1:
-            images.append(images[0].copy())
-        return images[0], images[1]
+            depth = frames.get_depth_frame()
+            if not color or not depth:
+                raise RuntimeError("Failed to read a RealSense RGB-D frame.")
+
+            color_profile = color.profile.as_video_stream_profile()
+            intr = color_profile.intrinsics
+            depth_sensor = self._profiles[idx].get_device().first_depth_sensor()
+            depth_scale = float(depth_sensor.get_depth_scale())
+            depth_raw = self._np.asarray(depth.get_data(), dtype=self._np.uint16).copy()
+            depth_m = depth_raw.astype(self._np.float32) * depth_scale
+            serial = ""
+            try:
+                serial = self._profiles[idx].get_device().get_info(self._rs.camera_info.serial_number)
+            except Exception:
+                pass
+            frames_out.append(
+                RGBDFrame(
+                    color=self._np.asarray(color.get_data(), dtype=self._np.uint8).copy(),
+                    depth_m=depth_m,
+                    intrinsics={
+                        "width": float(intr.width),
+                        "height": float(intr.height),
+                        "fx": float(intr.fx),
+                        "fy": float(intr.fy),
+                        "ppx": float(intr.ppx),
+                        "ppy": float(intr.ppy),
+                    },
+                    depth_scale=depth_scale,
+                    serial=serial,
+                )
+            )
+        if len(frames_out) == 1:
+            frame = frames_out[0]
+            frames_out.append(
+                RGBDFrame(
+                    color=frame.color.copy(),
+                    depth_m=frame.depth_m.copy(),
+                    intrinsics=dict(frame.intrinsics),
+                    depth_scale=frame.depth_scale,
+                    serial=frame.serial,
+                )
+            )
+        return frames_out[0], frames_out[1]
 
 
 def _resolve_path(path_text: str | Path) -> Path:
@@ -332,6 +391,50 @@ def _save_json(path: Path, payload: dict[str, Any]) -> None:
 def _save_text(path: Path, payload: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(payload, encoding="utf-8")
+
+
+def _save_rgbd_sidecars(prefix_path: Path, frame: RGBDFrame) -> dict[str, str]:
+    """Save depth/intrinsics next to an RGB image and return sidecar paths."""
+    import numpy as np
+
+    prefix_path.parent.mkdir(parents=True, exist_ok=True)
+    stem = prefix_path.with_suffix("")
+    depth_npy = stem.parent / f"{stem.name}_depth_m.npy"
+    depth_png = stem.parent / f"{stem.name}_depth_mm.png"
+    intrinsics_path = stem.parent / f"{stem.name}_intrinsics.json"
+    np.save(depth_npy, frame.depth_m)
+    depth_mm = np.nan_to_num(frame.depth_m, nan=0.0, posinf=0.0, neginf=0.0)
+    depth_mm = np.clip(depth_mm * 1000.0, 0.0, 65535.0).astype(np.uint16)
+    imageio.imwrite(depth_png, depth_mm)
+    _save_json(
+        intrinsics_path,
+        {
+            "intrinsics": frame.intrinsics,
+            "depth_scale": frame.depth_scale,
+            "serial": frame.serial,
+            "depth_units": "meters in .npy, millimeters in .png",
+        },
+    )
+    return {
+        "depth_m_npy": str(depth_npy),
+        "depth_mm_png": str(depth_png),
+        "intrinsics": str(intrinsics_path),
+    }
+
+
+def _write_rgbd_observation(
+    *,
+    global_path: Path,
+    wrist_path: Path,
+    global_frame: RGBDFrame,
+    wrist_frame: RGBDFrame,
+) -> dict[str, Any]:
+    imageio.imwrite(global_path, global_frame.color)
+    imageio.imwrite(wrist_path, wrist_frame.color)
+    return {
+        "global": _save_rgbd_sidecars(global_path, global_frame),
+        "wrist": _save_rgbd_sidecars(wrist_path, wrist_frame),
+    }
 
 
 def _read_optional_text(path: Path, *, max_chars: int = 12000) -> str:
@@ -776,6 +879,7 @@ def _snapshot_robot_initial_state(
 ) -> dict[str, Any]:
     return {
         "joints": controller.get_current_joints(),
+        "tcp_pose": controller.get_current_tcp_pose(),
         "gripper_open_ratio": controller.get_gripper_open_ratio(),
     }
 
@@ -817,6 +921,31 @@ def _capture_or_copy_images(
             _resize_image_file_width(target_wrist, resize_width)
         return
     raise RuntimeError("camera capture callback is required for real execution")
+
+
+def _capture_or_copy_observation(
+    *,
+    capture_observation_fn: Callable[[Path, Path, Path], dict[str, Any]] | None,
+    capture_images_fn: Callable[[Path, Path], None] | None,
+    target_global: Path,
+    target_wrist: Path,
+    target_scene_state: Path,
+    resize_width: int | None = None,
+) -> dict[str, Any] | None:
+    target_global.parent.mkdir(parents=True, exist_ok=True)
+    if capture_observation_fn is not None:
+        scene_state = capture_observation_fn(target_global, target_wrist, target_scene_state)
+        if resize_width is not None:
+            _resize_image_file_width(target_global, resize_width)
+            _resize_image_file_width(target_wrist, resize_width)
+        return scene_state
+    _capture_or_copy_images(
+        capture_images_fn=capture_images_fn,
+        target_global=target_global,
+        target_wrist=target_wrist,
+        resize_width=resize_width,
+    )
+    return None
 
 
 def _atomic_infos_from_supervisor(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1096,6 +1225,7 @@ def _phase_history_for_prompt(history: list[dict[str, Any]]) -> list[dict[str, A
                 "code_path": item.get("code_path"),
                 "global_image": item.get("after_global_image", item.get("after_global_rgb")),
                 "wrist_image": item.get("after_wrist_image", item.get("after_wrist_rgb")),
+                "scene_state": item.get("after_scene_state"),
                 "judge": item.get("judge"),
             }
         )
@@ -1126,6 +1256,7 @@ async def run_defense_agent_real_once(
     task: str,
     current_global_image: Path,
     current_wrist_image: Path,
+    current_scene_state: Path | None,
     planner_profile: Path,
     supervisor_profile: Path,
     coder_profile: Path,
@@ -1139,6 +1270,7 @@ async def run_defense_agent_real_once(
     embedding_base_url: str | None,
     embedding_dims: int,
     capture_images_fn: Callable[[Path, Path], None] | None = None,
+    capture_observation_fn: Callable[[Path, Path, Path], dict[str, Any]] | None = None,
 ) -> RealDefenseOutputs:
     del embedding_model, embedding_api_key, embedding_base_url, embedding_dims
 
@@ -1149,6 +1281,16 @@ async def run_defense_agent_real_once(
 
     initial_robot_state = _snapshot_robot_initial_state(controller)
     _save_json(log_dir / "initial_robot_state.json", initial_robot_state)
+    current_scene_state_payload = (
+        json.loads(current_scene_state.read_text(encoding="utf-8"))
+        if current_scene_state is not None and current_scene_state.exists()
+        else None
+    )
+    current_scene_state_brief = (
+        scene_state_brief(current_scene_state_payload)
+        if isinstance(current_scene_state_payload, dict)
+        else None
+    )
 
     observation = {
         "environment": "real_robot",
@@ -1158,6 +1300,7 @@ async def run_defense_agent_real_once(
             "wrist_image": str(current_wrist_image),
             "global_rgb": str(current_global_image),
             "wrist_rgb": str(current_wrist_image),
+            "scene_state": str(current_scene_state) if current_scene_state is not None else None,
         },
         "image_roles": {
             "global_image": "Global camera image showing the whole scene.",
@@ -1167,10 +1310,13 @@ async def run_defense_agent_real_once(
             ),
         },
         "runtime_note": (
-            "This is a real-robot one-pass validation. The only visual state inputs "
-            "are the global_image and wrist_image Intel RealSense D435i RGB images. "
-            "Do not assume a MuJoCo scene or reconstructed object pose JSON exists."
+            "This is a real-robot one-pass validation. The visual state inputs are "
+            "global_image and wrist_image Intel RealSense RGB images. When available, "
+            "scene_state contains RGB-D object position estimates relative to the "
+            "UR base and current gripper; use them as approximate guidance, not as "
+            "a replacement for cautious phase-wise motion."
         ),
+        "scene_state_brief": current_scene_state_brief,
     }
     coder_contracts = {
         "runtime_api": {
@@ -1270,6 +1416,8 @@ async def run_defense_agent_real_once(
     attempts: list[dict[str, Any]] = []
     latest_global = current_global_image
     latest_wrist = current_wrist_image
+    latest_scene_state = current_scene_state
+    latest_scene_state_payload = current_scene_state_payload
     last_code = ""
     last_execution: dict[str, Any] = {}
     last_judge: dict[str, Any] = {}
@@ -1334,7 +1482,7 @@ async def run_defense_agent_real_once(
                     "Current phase JSON:\n"
                     f"{json.dumps(phase_context, ensure_ascii=False, indent=2)}\n\n"
                     "Current observation JSON:\n"
-                    f"{json.dumps({'global_image': str(latest_global), 'wrist_image': str(latest_wrist), 'global_rgb': str(latest_global), 'wrist_rgb': str(latest_wrist), 'image_roles': observation['image_roles']}, ensure_ascii=False, indent=2)}\n\n"
+                    f"{json.dumps({'global_image': str(latest_global), 'wrist_image': str(latest_wrist), 'global_rgb': str(latest_global), 'wrist_rgb': str(latest_wrist), 'scene_state': str(latest_scene_state) if latest_scene_state is not None else None, 'scene_state_brief': scene_state_brief(latest_scene_state_payload) if isinstance(latest_scene_state_payload, dict) else None, 'image_roles': observation['image_roles']}, ensure_ascii=False, indent=2)}\n\n"
                     "Prior judger feedback JSON for this same phase, or null:\n"
                     f"{json.dumps(feedback, ensure_ascii=False, indent=2)}\n\n"
                     "Return exactly one fenced Python code block and nothing else."
@@ -1369,12 +1517,16 @@ async def run_defense_agent_real_once(
 
                 phase_global = attempt_dir / f"phase_{phase_spec.index:02d}_{phase_spec.slug}_global_rgb.png"
                 phase_wrist = attempt_dir / f"phase_{phase_spec.index:02d}_{phase_spec.slug}_wrist_rgb.png"
+                phase_scene_state = attempt_dir / f"phase_{phase_spec.index:02d}_{phase_spec.slug}_scene_state.json"
+                phase_scene_payload: dict[str, Any] | None = None
                 if not bool(syntax_report.get("ok")):
                     last_execution = {"ok": False, "signal": "SYNTAX_PHASE_OR_RUNTIME_TOOL_CHECK_FAILED"}
-                    _capture_or_copy_images(
+                    phase_scene_payload = _capture_or_copy_observation(
+                        capture_observation_fn=capture_observation_fn,
                         capture_images_fn=capture_images_fn,
                         target_global=phase_global,
                         target_wrist=phase_wrist,
+                        target_scene_state=phase_scene_state,
                         resize_width=128,
                     )
                 else:
@@ -1382,10 +1534,12 @@ async def run_defense_agent_real_once(
                         code=last_code,
                         controller=controller,
                     )
-                    _capture_or_copy_images(
+                    phase_scene_payload = _capture_or_copy_observation(
+                        capture_observation_fn=capture_observation_fn,
                         capture_images_fn=capture_images_fn,
                         target_global=phase_global,
                         target_wrist=phase_wrist,
+                        target_scene_state=phase_scene_state,
                         resize_width=128,
                     )
                     last_execution["phases"] = [
@@ -1399,6 +1553,8 @@ async def run_defense_agent_real_once(
                             "wrist_image": str(phase_wrist),
                             "global_rgb": str(phase_global),
                             "wrist_rgb": str(phase_wrist),
+                            "scene_state": str(phase_scene_state) if phase_scene_state.exists() else None,
+                            "scene_state_brief": scene_state_brief(phase_scene_payload) if phase_scene_payload else None,
                             "image_width_px": 128,
                             "error": last_execution.get("error"),
                         }
@@ -1417,6 +1573,8 @@ async def run_defense_agent_real_once(
                     "wrist_image": str(phase_wrist),
                     "global_rgb": str(phase_global),
                     "wrist_rgb": str(phase_wrist),
+                    "scene_state": str(phase_scene_state) if phase_scene_state.exists() else None,
+                    "scene_state_brief": scene_state_brief(phase_scene_payload) if phase_scene_payload else None,
                     "error": last_execution.get("error"),
                     "image_width_px": 128,
                     "is_final_phase": phase_spec.index == len(phase_specs),
@@ -1438,7 +1596,8 @@ async def run_defense_agent_real_once(
                     "Current phase manifest JSON. The two attached images are exactly this "
                     "phase's global_image and wrist_image, in that order. global_image shows "
                     "the whole scene; wrist_image is from the gripper viewpoint and may show "
-                    "part of the gripper at the bottom:\n"
+                    "part of the gripper at the bottom. If scene_state_brief is present, use "
+                    "its approximate post-execution RGB-D distances as supporting evidence:\n"
                     f"{json.dumps(current_phase_manifest, ensure_ascii=False, indent=2)}\n\n"
                     "Judge only the current phase against success_criteria. If this phase has "
                     "visibly failed, return FAIL and explain this phase's failure and the code "
@@ -1470,6 +1629,8 @@ async def run_defense_agent_real_once(
                     "wrist_image": str(phase_wrist),
                     "global_rgb": str(phase_global),
                     "wrist_rgb": str(phase_wrist),
+                    "scene_state": str(phase_scene_state) if phase_scene_state.exists() else None,
+                    "scene_state_brief": scene_state_brief(phase_scene_payload) if phase_scene_payload else None,
                     "judge": phase_judge,
                 }
                 _save_json(attempt_dir / f"real_atomic_judge_phase_{phase_spec.index:02d}.json", phase_judge_with_context)
@@ -1489,6 +1650,7 @@ async def run_defense_agent_real_once(
                     "after_wrist_image": str(phase_wrist),
                     "after_global_rgb": str(phase_global),
                     "after_wrist_rgb": str(phase_wrist),
+                    "after_scene_state": str(phase_scene_state) if phase_scene_state.exists() else None,
                     "phase_images": [current_phase_manifest],
                     "phase_judgements": [phase_judge_with_context],
                     "code_path": str(attempt_dir / "real_phase_actions.py"),
@@ -1497,6 +1659,8 @@ async def run_defense_agent_real_once(
 
                 latest_global = phase_global
                 latest_wrist = phase_wrist
+                latest_scene_state = phase_scene_state if phase_scene_state.exists() else latest_scene_state
+                latest_scene_state_payload = phase_scene_payload or latest_scene_state_payload
                 if _is_success_judge(phase_judge):
                     phase_history.append(attempt_record)
                     phase_done = True
@@ -1579,6 +1743,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-fps", type=int, default=30)
     parser.add_argument("--camera-warmup-frames", type=int, default=15)
     parser.add_argument(
+        "--global-camera-base-transform",
+        type=Path,
+        default=None,
+        help="JSON file containing a 4x4 transform matrix T_base_global_camera.",
+    )
+    parser.add_argument(
+        "--wrist-camera-gripper-transform",
+        type=Path,
+        default=None,
+        help="JSON file containing a 4x4 transform matrix T_gripper_wrist_camera.",
+    )
+    parser.add_argument(
+        "--wrist-camera-offset-y-m",
+        type=float,
+        default=-0.02,
+        help="Fallback wrist camera offset along gripper Y when no transform file is supplied.",
+    )
+    parser.add_argument(
+        "--perception-backend",
+        choices=["yolo", "color", "none"],
+        default="yolo",
+        help="Object-estimation backend for scene_state. Use yolo for segmentation-model masks.",
+    )
+    parser.add_argument(
+        "--yolo-seg-model",
+        type=Path,
+        default=None,
+        help="Path/name of an Ultralytics YOLO segmentation model, e.g. models/best.pt or yolo11n-seg.pt.",
+    )
+    parser.add_argument("--yolo-conf", type=float, default=0.35, help="YOLO detection confidence threshold.")
+    parser.add_argument("--yolo-iou", type=float, default=0.5, help="YOLO NMS IoU threshold.")
+    parser.add_argument(
+        "--yolo-target-labels",
+        default="",
+        help="Comma-separated YOLO class labels to include. If omitted, all YOLO detections are included.",
+    )
+    parser.add_argument(
         "--current-global-image",
         dest="current_global_image",
         type=Path,
@@ -1615,13 +1816,28 @@ async def _main_async() -> int:
         return 0
     if not str(args.task).strip():
         raise ValueError("--task is required unless --list-cameras is used.")
+    if str(args.perception_backend).strip().lower() == "yolo" and not args.yolo_seg_model and not args.capture_only:
+        raise ValueError("--perception-backend yolo requires --yolo-seg-model for real execution.")
 
     run_dir = _resolve_path(args.log_root) / time.strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
 
     current_global = run_dir / "current_global_rgb.png"
     current_wrist = run_dir / "current_wrist_rgb.png"
+    current_scene = run_dir / "current_scene_state.json"
     serials = [s.strip() for s in str(args.camera_serials).split(",") if s.strip()]
+    t_base_global_camera = load_transform(args.global_camera_base_transform)
+    t_gripper_wrist_camera = (
+        load_transform(args.wrist_camera_gripper_transform)
+        if args.wrist_camera_gripper_transform
+        else gripper_to_wrist_camera_transform(float(args.wrist_camera_offset_y_m))
+    )
+    yolo_target_labels = [
+        label.strip()
+        for label in str(args.yolo_target_labels or "").split(",")
+        if label.strip()
+    ]
+    yolo_model_path = str(args.yolo_seg_model) if args.yolo_seg_model else None
 
     controller = UR7eVectorController(
         robot_ip=str(args.robot_ip),
@@ -1635,6 +1851,29 @@ async def _main_async() -> int:
     supervisor_profile = _prepare_real_profile_copy(_resolve_path(args.supervisor_profile), run_dir, "supervisor")
     coder_profile = _prepare_real_profile_copy(_resolve_path(args.coder_profile), run_dir, "coder")
     judger_profile = _prepare_real_profile_copy(_resolve_path(args.judger_profile), run_dir, "judger")
+
+    def make_scene_state(
+        *,
+        global_frame: RGBDFrame | None,
+        wrist_frame: RGBDFrame | None,
+        scene_path: Path,
+    ) -> dict[str, Any]:
+        tcp_pose = controller.get_current_tcp_pose()
+        scene_state = build_scene_state(
+            task_text=str(args.task).strip(),
+            global_frame=global_frame,
+            wrist_frame=wrist_frame,
+            tcp_pose_base=tcp_pose,
+            t_base_global_camera=t_base_global_camera,
+            t_gripper_wrist_camera=t_gripper_wrist_camera,
+            perception_backend=str(args.perception_backend),
+            yolo_model_path=yolo_model_path,
+            yolo_confidence=float(args.yolo_conf),
+            yolo_iou=float(args.yolo_iou),
+            yolo_target_labels=yolo_target_labels,
+        )
+        _save_json(scene_path, scene_state)
+        return scene_state
     if source_global or source_wrist:
         if not source_global or not source_wrist:
             raise ValueError("--current-global-image and --current-wrist-image must be provided together.")
@@ -1662,10 +1901,25 @@ async def _main_async() -> int:
                     imageio.imwrite(global_path, global_done)
                     imageio.imwrite(wrist_path, wrist_done)
 
+                def capture_observation(global_path: Path, wrist_path: Path, scene_path: Path) -> dict[str, Any]:
+                    global_frame, wrist_frame = cameras.capture_rgbd()
+                    _write_rgbd_observation(
+                        global_path=global_path,
+                        wrist_path=wrist_path,
+                        global_frame=global_frame,
+                        wrist_frame=wrist_frame,
+                    )
+                    return make_scene_state(
+                        global_frame=global_frame,
+                        wrist_frame=wrist_frame,
+                        scene_path=scene_path,
+                    )
+
                 outputs = await run_defense_agent_real_once(
                     task=str(args.task).strip(),
                     current_global_image=current_global,
                     current_wrist_image=current_wrist,
+                    current_scene_state=current_scene if current_scene.exists() else None,
                     planner_profile=planner_profile,
                     supervisor_profile=supervisor_profile,
                     coder_profile=coder_profile,
@@ -1679,6 +1933,7 @@ async def _main_async() -> int:
                     embedding_base_url=args.embedding_base_url,
                     embedding_dims=int(args.embedding_dims),
                     capture_images_fn=capture_images,
+                    capture_observation_fn=capture_observation,
                 )
             finally:
                 controller.close()
@@ -1687,6 +1942,7 @@ async def _main_async() -> int:
             "run_dir": str(run_dir),
             "current_global_image": str(current_global),
             "current_wrist_image": str(current_wrist),
+            "current_scene_state": str(current_scene) if current_scene.exists() else None,
             "plan_status": outputs.plan.get("status"),
             "atomic_task_count": len(_atomic_infos_from_supervisor(outputs.atomic_task_info)),
             "completed": outputs.completed,
@@ -1707,9 +1963,13 @@ async def _main_async() -> int:
         fps=int(args.camera_fps),
         warmup_frames=int(args.camera_warmup_frames),
     ) as cameras:
-        global_img, wrist_img = cameras.capture()
-        imageio.imwrite(current_global, global_img)
-        imageio.imwrite(current_wrist, wrist_img)
+        global_frame, wrist_frame = cameras.capture_rgbd()
+        rgbd_sidecars = _write_rgbd_observation(
+            global_path=current_global,
+            wrist_path=current_wrist,
+            global_frame=global_frame,
+            wrist_frame=wrist_frame,
+        )
 
         if args.capture_only:
             summary = {
@@ -1717,8 +1977,9 @@ async def _main_async() -> int:
                 "capture_only": True,
                 "global_image": str(current_global),
                 "wrist_image": str(current_wrist),
-                "global_shape": list(global_img.shape),
-                "wrist_shape": list(wrist_img.shape),
+                "global_shape": list(global_frame.color.shape),
+                "wrist_shape": list(wrist_frame.color.shape),
+                "rgbd_sidecars": rgbd_sidecars,
                 "global_exists": current_global.exists(),
                 "wrist_exists": current_wrist.exists(),
             }
@@ -1731,16 +1992,36 @@ async def _main_async() -> int:
             controller.connect()
             if controller.is_gripper_available():
                 _log(f"Gripper backend: {controller.get_gripper_backend()}")
+            make_scene_state(
+                global_frame=global_frame,
+                wrist_frame=wrist_frame,
+                scene_path=current_scene,
+            )
 
             def capture_images(global_path: Path, wrist_path: Path) -> None:
                 global_done, wrist_done = cameras.capture()
                 imageio.imwrite(global_path, global_done)
                 imageio.imwrite(wrist_path, wrist_done)
 
+            def capture_observation(global_path: Path, wrist_path: Path, scene_path: Path) -> dict[str, Any]:
+                global_done_frame, wrist_done_frame = cameras.capture_rgbd()
+                _write_rgbd_observation(
+                    global_path=global_path,
+                    wrist_path=wrist_path,
+                    global_frame=global_done_frame,
+                    wrist_frame=wrist_done_frame,
+                )
+                return make_scene_state(
+                    global_frame=global_done_frame,
+                    wrist_frame=wrist_done_frame,
+                    scene_path=scene_path,
+                )
+
             outputs = await run_defense_agent_real_once(
                 task=str(args.task).strip(),
                 current_global_image=current_global,
                 current_wrist_image=current_wrist,
+                current_scene_state=current_scene,
                 planner_profile=planner_profile,
                 supervisor_profile=supervisor_profile,
                 coder_profile=coder_profile,
@@ -1754,6 +2035,7 @@ async def _main_async() -> int:
                 embedding_base_url=args.embedding_base_url,
                 embedding_dims=int(args.embedding_dims),
                 capture_images_fn=capture_images,
+                capture_observation_fn=capture_observation,
             )
 
         finally:
@@ -1761,6 +2043,9 @@ async def _main_async() -> int:
 
     summary = {
         "run_dir": str(run_dir),
+        "current_global_image": str(current_global),
+        "current_wrist_image": str(current_wrist),
+        "current_scene_state": str(current_scene) if current_scene.exists() else None,
         "plan_status": outputs.plan.get("status"),
         "atomic_task_count": len(_atomic_infos_from_supervisor(outputs.atomic_task_info)),
         "completed": outputs.completed,

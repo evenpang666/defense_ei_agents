@@ -41,6 +41,11 @@ Generation rules:
   `pour`; expand the current requested phase into low-level motion commands.
 - Do not invent exact object coordinates from RGB images alone.
 - Use small relative motions, slow contact, and explicit gripper commands.
+- If `scene_state_brief` is present, it may include approximate
+  `center_gripper_mm` and `grasp_region_center_gripper_mm` values from RGB-D
+  perception. Use these only as direction and distance hints for bounded
+  gripper-frame corrections. Split large offsets into small cautious moves and
+  do not drive directly into contact based on depth alone.
 - Overall motion must be slow enough to protect real objects. Prefer many small
   axis-wise increments and low `velocity`/`acceleration` over a single large move.
 - Near-object interaction phases must be slower than transit phases: approach,

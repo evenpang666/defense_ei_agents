@@ -58,7 +58,7 @@ export EMBEDDING_DIMS="1536"
 Install the project dependencies, DefenseAgent, RealSense bindings, and UR RTDE support in the active Python environment:
 
 ```bash
-pip install imageio pyyaml numpy openai ur-rtde pyrealsense2
+pip install imageio pyyaml numpy openai ur-rtde pyrealsense2 ultralytics
 pip install DefenseAgent
 ```
 
@@ -82,7 +82,7 @@ The runtime uses:
 - URScript secondary socket: port `30002`
 - RTDE receive: port `30004`
 - Robotiq socket: port `63352`
-- Two Intel RealSense D435i RGB streams, global and wrist
+- Two Intel RealSense D435i RGB-D streams, global and wrist
 
 If only one RealSense stream is found, it is reused as both global and wrist input. For reliable judging, use two cameras and pass serials explicitly:
 
@@ -98,6 +98,60 @@ python evaluate_defense_agent_real.py --list-cameras
 
 If listing cameras reports access denied on Windows, close Intel RealSense Viewer or other camera apps and check Windows camera privacy permissions.
 
+## RGB-D Scene State
+
+The workflow now saves depth sidecars and a structured `scene_state.json` for
+the initial observation and every post-phase capture. The scene state is passed
+to both coder and judger as approximate support for object/grasp-region
+distances relative to the current gripper. Object estimation uses YOLO
+segmentation masks plus RealSense depth.
+
+For calibrated base-frame coordinates, provide the fixed global-camera extrinsic:
+
+```bash
+python evaluate_defense_agent_real.py \
+  --task "pick up the red block and place it into the bowl" \
+  --robot-ip 169.254.26.10 \
+  --camera-serials GLOBAL_SERIAL,WRIST_SERIAL \
+  --global-camera-base-transform calibration/t_base_global_camera.json \
+  --yolo-seg-model models/best.pt
+```
+
+The transform file should contain either a top-level 4x4 JSON array or
+`{"matrix": [[...], [...], [...], [...]]}` for `T_base_global_camera`. If no
+global-camera transform is supplied, the run still saves RGB-D sidecars and
+camera-frame estimates, but base/gripper object coordinates are `null`.
+
+The wrist camera defaults to an approximate gripper transform with a `-0.02 m`
+offset along gripper Y. Override it with:
+
+```bash
+--wrist-camera-gripper-transform calibration/t_gripper_wrist_camera.json
+```
+
+Use a YOLO segmentation model, not a detection-only model. For Ultralytics this
+means a `*-seg.pt` model or your own trained segmentation checkpoint. The mask
+pixels are combined with aligned depth, then converted into
+`objects[].grasp_region_center_gripper_mm`.
+
+To limit scene_state to specific YOLO classes, pass comma-separated labels:
+
+```bash
+--yolo-target-labels block,bowl
+```
+
+If labels are omitted, all YOLO segmentation detections are included. You can
+tune thresholds with:
+
+```bash
+--yolo-conf 0.35 --yolo-iou 0.5
+```
+
+To create `calibration/t_base_global_camera.json`, use
+`calibrate_global_camera.py`. See
+[`docs/global_camera_calibration.md`](docs/global_camera_calibration.md) for the
+full step-by-step procedure.
+
 ## Capture Images Only
 
 Use this to verify camera wiring without connecting to the robot:
@@ -109,7 +163,9 @@ python evaluate_defense_agent_real.py \
   --camera-serials GLOBAL_SERIAL,WRIST_SERIAL
 ```
 
-The command writes `current_global_rgb.png`, `current_wrist_rgb.png`, and `summary.json` under `logs/defense_agent_real/<timestamp>/`.
+The command writes `current_global_rgb.png`, `current_wrist_rgb.png`, depth
+sidecars, intrinsics JSON files, and `summary.json` under
+`logs/defense_agent_real/<timestamp>/`.
 
 ## Run The Full Workflow
 
@@ -168,6 +224,8 @@ Each run creates a timestamped directory under `logs/defense_agent_real/` contai
 - `atomic_XX/phase_NN_<slug>/attempt_YY/phase_NN_<slug>_global_rgb.png` and
   `phase_NN_<slug>_wrist_rgb.png`: post-phase validation images, resized
   proportionally to 128 px wide
+- `atomic_XX/phase_NN_<slug>/attempt_YY/phase_NN_<slug>_scene_state.json`:
+  post-phase RGB-D scene-state estimates for coder/judger context
 - `atomic_XX/phase_NN_<slug>/attempt_YY/real_atomic_judge_phase_NN.json`:
   per-phase judger result; the next phase is generated only after this phase is
   judged `SUCCESS`

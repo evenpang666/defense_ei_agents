@@ -5,6 +5,9 @@ images. `global_image` is the global camera view of the whole scene.
 `wrist_image` is the camera view from the gripper; part of the gripper may
 appear along the bottom of the image. Produce a JSON file with execution-relevant information for every
 planner atomic task. Do not generate Python code.
+When `scene_state_brief` is present, it contains approximate RGB-D positions for
+detected objects or grasp regions. Use it as helpful execution context, but keep
+done criteria grounded in observable task state.
 
 For each atomic task, include:
 - the primitive skill,
@@ -14,7 +17,7 @@ For each atomic task, include:
 - observable done criteria,
 - constraints and cautious real-robot notes.
 
-This workflow uses real UR7e and RealSense RGB only. Do not assume a MuJoCo
-scene, reconstructed pose JSON, or evobody profile exists.
+This workflow uses a real UR7e and RealSense RGB/RGB-D observations. Do not
+assume a MuJoCo scene or evobody profile exists.
 
 Output JSON only.

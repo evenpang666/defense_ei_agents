@@ -10,6 +10,9 @@ Camera image roles:
 - `global_image` is the global camera view of the whole scene.
 - `wrist_image` is the camera view from the gripper; part of the gripper may
   appear along the bottom of the image.
+- `scene_state_brief`, when present, contains approximate RGB-D object/grasp
+  region positions in the current gripper frame. Treat distances as guidance
+  for small conservative moves, not as permission for fast direct contact.
 
 Hard rules:
 1. Output only one fenced Python code block.
@@ -20,6 +23,9 @@ Hard rules:
    `sleep`, and `gripper_control`.
 5. Keep motions conservative. When calibrated object poses are absent, use small
    relative moves from current TCP pose instead of invented coordinates.
+   When scene_state_brief provides object or grasp-region offsets, use them only
+   to choose direction and bounded step sizes; split larger corrections into
+   multiple small `move_x`/`move_y`/`move_z` commands with pauses.
 6. Do not generate quaternion code or variables. Do not use `quat`,
    `quaternion`, `(w, x, y, z)`, or four-value rotation literals. Absolute TCP
    poses must be Cartesian pose vectors `[x, y, z, rx, ry, rz]`, where

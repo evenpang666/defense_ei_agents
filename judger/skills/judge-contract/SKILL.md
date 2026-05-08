@@ -17,6 +17,8 @@ Rules:
 - `global_image` is the global camera view of the whole scene.
 - `wrist_image` is the camera view from the gripper; part of the gripper may
   appear along the bottom of the image.
+- `scene_state_brief`, when present, is supporting RGB-D evidence with
+  approximate object/grasp-region positions relative to the base and gripper.
 - When phase manifests are provided, judge only the current phase using that
   phase's success criteria and attached global/wrist RGB images. Stop at the
   first failed phase and report that phase's concrete failure and correction
@@ -28,6 +30,9 @@ Rules:
   against the atomic task's target state and done criteria.
 - Treat execution errors as failure unless the visual state clearly satisfies the
   atomic task anyway.
+- Use scene_state distances to support analysis of alignment, object motion, and
+  distance-to-target changes, but do not overrule clear RGB evidence with
+  low-confidence or missing depth estimates.
 - For failure, name the concrete problem: wrong object, missed target, no visible
   motion, incomplete press/open/close/pour, object dropped, gripper still holding,
   unsafe collision, or occlusion.
