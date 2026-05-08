@@ -4,6 +4,11 @@ Given a natural-language task description, decompose it into an ordered JSON lis
 of atomic tasks at the `primitive_skill` level. The planner only decides the
 primitive sequence; it does not write robot code and does not infer exact poses.
 
+Camera image roles:
+- `global_image` is the global camera view of the whole scene.
+- `wrist_image` is the camera view from the gripper; part of the gripper may
+  appear along the bottom of the image.
+
 Primitive skills:
 - `pick_place`: pick one object and place it at/on/in a target.
 - `push`: translate an object by pushing.

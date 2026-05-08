@@ -4,8 +4,8 @@ This workflow runs four DefenseAgent ReAct agents around a real UR7e:
 
 1. `planner` decomposes the natural-language task into primitive-level atomic tasks.
 2. `supervisor` turns each atomic task into execution-relevant information and visual done criteria.
-3. `coder` generates restricted Python for exactly one atomic task.
-4. `judger` evaluates the post-execution front/wrist RGB images and returns `SUCCESS` or `FAIL`.
+3. `coder` generates restricted Python for exactly one phase of one atomic task.
+4. `judger` evaluates each post-phase global/wrist RGB image pair and returns `SUCCESS` or `FAIL`.
 
 The orchestrator is `evaluate_defense_agent_real.py`. It executes real robot code only; there is no dry-run or generate-only mode.
 
@@ -82,15 +82,15 @@ The runtime uses:
 - URScript secondary socket: port `30002`
 - RTDE receive: port `30004`
 - Robotiq socket: port `63352`
-- Two Intel RealSense D435i RGB streams, front and wrist
+- Two Intel RealSense D435i RGB streams, global and wrist
 
-If only one RealSense stream is found, it is reused as both front and wrist input. For reliable judging, use two cameras and pass serials explicitly:
+If only one RealSense stream is found, it is reused as both global and wrist input. For reliable judging, use two cameras and pass serials explicitly:
 
 ```bash
---camera-serials FRONT_SERIAL,WRIST_SERIAL
+--camera-serials GLOBAL_SERIAL,WRIST_SERIAL
 ```
 
-`FRONT_SERIAL` and `WRIST_SERIAL` are placeholders. To list the serials detected by `pyrealsense2`, run:
+`GLOBAL_SERIAL` and `WRIST_SERIAL` are placeholders. To list the serials detected by `pyrealsense2`, run:
 
 ```bash
 python evaluate_defense_agent_real.py --list-cameras
@@ -106,10 +106,10 @@ Use this to verify camera wiring without connecting to the robot:
 python evaluate_defense_agent_real.py \
   --task "capture test" \
   --capture-only \
-  --camera-serials FRONT_SERIAL,WRIST_SERIAL
+  --camera-serials GLOBAL_SERIAL,WRIST_SERIAL
 ```
 
-The command writes `current_front_rgb.png`, `current_wrist_rgb.png`, and `summary.json` under `logs/defense_agent_real/<timestamp>/`.
+The command writes `current_global_rgb.png`, `current_wrist_rgb.png`, and `summary.json` under `logs/defense_agent_real/<timestamp>/`.
 
 ## Run The Full Workflow
 
@@ -119,7 +119,7 @@ Normal run with live initial capture:
 python evaluate_defense_agent_real.py \
   --task "pick up the red block and place it into the bowl" \
   --robot-ip 169.254.26.10 \
-  --camera-serials FRONT_SERIAL,WRIST_SERIAL \
+  --camera-serials GLOBAL_SERIAL,WRIST_SERIAL \
   --max-attempts-per-atomic 3
 ```
 
@@ -130,13 +130,13 @@ Run from existing initial images while still using RealSense for post-execution 
 ```bash
 python evaluate_defense_agent_real.py \
   --task "pick up the red block and place it into the bowl" \
-  --current-front-image logs/example/current_front_rgb.png \
+  --current-global-image logs/example/current_global_rgb.png \
   --current-wrist-image logs/example/current_wrist_rgb.png \
   --robot-ip 169.254.26.10 \
-  --camera-serials FRONT_SERIAL,WRIST_SERIAL
+  --camera-serials GLOBAL_SERIAL,WRIST_SERIAL
 ```
 
-When existing initial images are supplied, both paths must be provided. The orchestrator still opens the RealSense cameras so the judger receives fresh after-action images.
+When existing initial images are supplied, both paths must be provided. The orchestrator still opens the RealSense cameras so the judger receives fresh after-action images. `global_image` is the whole-scene view; `wrist_image` is the gripper view and may show part of the gripper along the bottom.
 
 ## Robotiq Fallback
 
@@ -159,20 +159,25 @@ Each run creates a timestamped directory under `logs/defense_agent_real/` contai
 - `real_*_profile.yaml`: resolved profile copies for the run
 - `defense_ei_plan.json`: planner output
 - `defense_ei_atomic_task_info.json`: supervisor output
-- `atomic_XX/attempt_YY/real_atomic_actions.py`: generated code
-- `atomic_XX/attempt_YY/syntax_check.json`: syntax and runtime API validation
-- `atomic_XX/attempt_YY/real_execution.json`: robot execution report
-- `atomic_XX/attempt_YY/phase_NN_<slug>_front_rgb.png` and
-  `phase_NN_<slug>_wrist_rgb.png`: per-phase validation images, resized
+- `atomic_XX/phase_NN_<slug>/attempt_YY/real_phase_actions.py`: generated code
+  for one phase only
+- `atomic_XX/phase_NN_<slug>/attempt_YY/syntax_check.json`: syntax and runtime
+  API validation for that phase
+- `atomic_XX/phase_NN_<slug>/attempt_YY/real_execution.json`: robot execution
+  report for that phase
+- `atomic_XX/phase_NN_<slug>/attempt_YY/phase_NN_<slug>_global_rgb.png` and
+  `phase_NN_<slug>_wrist_rgb.png`: post-phase validation images, resized
   proportionally to 128 px wide
-- `atomic_XX/attempt_YY/real_atomic_judge_phase_NN.json`: per-phase judger
-  result; validation sends only that phase's front/wrist pair and stops at the
-  first failed phase
-- `atomic_XX/attempt_YY/real_atomic_judge.json`: final or first-failed-phase
-  judger result
+- `atomic_XX/phase_NN_<slug>/attempt_YY/real_atomic_judge_phase_NN.json`:
+  per-phase judger result; the next phase is generated only after this phase is
+  judged `SUCCESS`
+- `atomic_XX/phase_NN_<slug>/attempt_YY/real_atomic_judge.json`: final result
+  for the current phase attempt
 - `summary.json`: final status summary
 
 Exit code is `0` when all atomic tasks complete and `2` when the workflow stops after failed attempts.
+`--max-attempts-per-atomic` now limits retries for each phase within an atomic
+task.
 
 ## Profiles And Contracts
 

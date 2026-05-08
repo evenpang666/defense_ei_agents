@@ -14,13 +14,17 @@ Return exactly this JSON object:
 
 Rules:
 - Judge one atomic task at a time.
-- When phase manifests are provided, judge phases in order using only the current
-  phase's attached front/wrist RGB images. Stop at the first failed phase and
-  report that phase's concrete failure and correction target.
+- `global_image` is the global camera view of the whole scene.
+- `wrist_image` is the camera view from the gripper; part of the gripper may
+  appear along the bottom of the image.
+- When phase manifests are provided, judge only the current phase using that
+  phase's success criteria and attached global/wrist RGB images. Stop at the
+  first failed phase and report that phase's concrete failure and correction
+  target.
 - For a non-final phase, `SUCCESS` means the current phase goal appears achieved
   and validation may continue. For the final phase, `SUCCESS` means the full
   atomic task's target state and done criteria are satisfied.
-- When no phase manifest is provided, compare the final front/wrist RGB images
+- When no phase manifest is provided, compare the final global/wrist RGB images
   against the atomic task's target state and done criteria.
 - Treat execution errors as failure unless the visual state clearly satisfies the
   atomic task anyway.

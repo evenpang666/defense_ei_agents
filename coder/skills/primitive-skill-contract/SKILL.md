@@ -11,8 +11,9 @@ Use this contract when the atomic task info contains a `primitive`,
 
 ## Global Rules
 
-- Implement the named primitive skill as a complete motion sequence, not as a
-  single vague move.
+- Implement only the current requested phase of the named primitive skill. The
+  orchestrator executes this phase, captures images, and asks the judger for
+  phase feedback before requesting the next phase.
 - `move_x(distance, velocity=0.04, acceleration=0.18)`, `move_y(...)`, and `move_z(...)` use millimeters in the gripper/wrist-image frame. `rotate_x(angle_rad, ...)`, `rotate_y(...)`, and `rotate_z(...)` use radians. Do not pass `steps`; real hardware uses velocity and acceleration.
 - Use the wrist-image/gripper frame for relative moves: wrist image right is
   gripper +X, wrist image down is gripper +Y, and the wrist image viewing
@@ -32,7 +33,7 @@ Use this contract when the atomic task info contains a `primitive`,
 - Use only `move_x`, `move_y`, `move_z`, `rotate_x`, `rotate_y`, and `rotate_z` for incremental arm motion. Do not call `move_ee`, `ee_pose`, `move_to`, or `print`; generated code cannot use those APIs. With RGB-only
   observations, use conservative relative moves and make the intended phase
   explicit.
-- Every stage must start with
+- The generated code for a phase must start with exactly one
   `# === DEFENSE_EI_PHASE: <slug> | <short goal> ===`.
 - Keep the gripper state explicit before and after contact.
 - Primitive names are never callable runtime APIs. Do not call `pick_place`,
@@ -63,7 +64,7 @@ Use this contract when the atomic task info contains a `primitive`,
 11. Retract vertically upward to a safe height slowly before any horizontal
     motion away.
 
-Required phase order for generated code:
+Required phase order:
 
 - `point_down`
 - `approach_source_above`
@@ -76,6 +77,32 @@ Required phase order for generated code:
 - `release_at_target`
 - `retract_up`
 
+Phase success criteria for staged execution:
+
+- `point_down`: the gripper is oriented for a vertical-down approach to the
+  table/object, without contacting the object or colliding with the scene.
+- `approach_source_above`: the gripper is safely above the operated object and
+  laterally aligned for grasping, while still clear of the object and clutter.
+- `open_gripper`: the gripper fingers are visibly open enough for the object,
+  and the object has not been disturbed.
+- `descend_to_source`: the gripper has moved vertically to the source grasp
+  height, remains aligned around or immediately beside the object, and has not
+  pushed the object away.
+- `grasp_source`: the gripper is closed on the correct object with a stable
+  grasp; the object is not missed, dropped, knocked over, or squeezed out.
+- `lift_to_safe_height`: the grasped object rises with the gripper to a safe
+  carry height, clear of the table, source area, rims, and intervening objects.
+- `transfer_above_target`: the object remains held while the gripper translates
+  horizontally to a pose above the target region/opening at safe height.
+- `descend_to_target`: the held object descends vertically into or onto the
+  target placement region without hitting rims, obstacles, or missing the target.
+- `release_at_target`: the gripper opens and leaves the correct object at the
+  target position; the object is no longer held and has not rolled or fallen out
+  of place.
+- `retract_up`: the gripper retracts vertically to a safe height without
+  disturbing the placed object; the full `pick_place` atomic task target state
+  is satisfied.
+
 For container targets such as beakers, cups, bins, or bowls:
 
 - Transfer to above the opening/rim first.
@@ -87,13 +114,13 @@ For container targets such as beakers, cups, bins, or bowls:
 Do not skip `open_gripper` before descent or `lift_to_safe_height` before
 horizontal transfer.
 
-Pseudocode template:
+Per-phase pseudocode templates:
 
 ```python
 # === DEFENSE_EI_PHASE: point_down | orient gripper downwards ===
-rotate_(...); sleep(...)
+rotate_x/y(...); sleep(...)
 # === DEFENSE_EI_PHASE: approach_source_above | align above source using small wrist-frame corrections ===
-move_(...); sleep(...)
+move_x/y(...); sleep(...)
 # === DEFENSE_EI_PHASE: open_gripper | prepare for grasp ===
 gripper_control(0, 120); sleep(...)
 # === DEFENSE_EI_PHASE: descend_to_source | slow vertical descent ===
@@ -103,9 +130,9 @@ gripper_control(255, 250); sleep(...)
 # === DEFENSE_EI_PHASE: lift_to_safe_height | lift before horizontal transfer ===
 move_z(...); sleep(...)
 # === DEFENSE_EI_PHASE: transfer_above_target | horizontal transfer at safe height ===
-move_z(...); sleep(...)
+move_x/y(...); sleep(...)
 # === DEFENSE_EI_PHASE: descend_to_target | slow vertical placement ===
-move_(...); sleep(...)
+move_z(...); sleep(...)
 # === DEFENSE_EI_PHASE: release_at_target | release object ===
 gripper_control(0, 180); sleep(...)
 # === DEFENSE_EI_PHASE: retract_up | retreat vertically ===
@@ -123,7 +150,24 @@ pusher. Required phase order:
 - `push_slowly`
 - `retract_from_contact`
 
-Pseudocode template:
+Phase success criteria for staged execution:
+
+- `approach_push_start`: the gripper is near the intended push start pose,
+  aligned behind or beside the correct object along the intended push direction,
+  without contacting or moving it yet.
+- `set_push_contact_shape`: the gripper forms a stable pusher shape such as
+  closed or partially closed fingers, with no unwanted object motion.
+- `descend_or_advance_to_contact`: the gripper makes gentle, controlled contact
+  with the correct object at the intended push face without tipping, lifting, or
+  displacing it prematurely.
+- `push_slowly`: the correct object moves in the intended direction by the
+  required amount while staying stable and avoiding collisions with unintended
+  objects.
+- `retract_from_contact`: the gripper moves away from the object after the push
+  without dragging it back; the pushed object remains at the target state for
+  the atomic task.
+
+Per-phase pseudocode templates:
 
 ```python
 # === DEFENSE_EI_PHASE: approach_push_start | align gripper before contact ===
@@ -150,7 +194,22 @@ direction. Required phase order:
 - `release_if_grasped`
 - `retract_from_contact`
 
-Pseudocode template:
+Phase success criteria for staged execution:
+
+- `approach_pull_contact`: the gripper is aligned with the object's pullable
+  feature or contact side, close enough to engage it without disturbing the
+  object.
+- `grasp_or_hook`: the gripper visibly grasps, hooks, or otherwise secures the
+  correct object/feature so it can be pulled without slipping immediately.
+- `pull_slowly`: the correct object moves in the intended pull direction by the
+  required amount while remaining controlled and not colliding with unrelated
+  objects.
+- `release_if_grasped`: if the object was grasped or hooked, the gripper
+  releases it cleanly at the pulled target state without moving it back.
+- `retract_from_contact`: the gripper retreats from the object without further
+  contact; the pulled object remains at the desired final state.
+
+Per-phase pseudocode templates:
 
 ```python
 # === DEFENSE_EI_PHASE: approach_pull_contact | align to pull feature ===
@@ -177,7 +236,23 @@ Required phase order:
 - `hold_press`
 - `retract_from_press`
 
-Pseudocode template:
+Phase success criteria for staged execution:
+
+- `approach_press_target`: the gripper is aligned with the correct press target
+  and close to it, with no unintended contact or activation yet.
+- `set_press_contact_shape`: the gripper forms a stable contact surface for
+  pressing while remaining aligned with the correct target.
+- `press_slowly`: the gripper presses the correct target along its apparent
+  normal far enough to actuate or depress it, without sliding off or striking
+  nearby objects.
+- `hold_press`: the gripper maintains the press long enough for the target
+  effect to register, with the target still visibly depressed or actuated if
+  observable.
+- `retract_from_press`: the gripper retracts along the approach direction
+  without additional disturbance; the pressed target shows the desired final
+  state if visible.
+
+Per-phase pseudocode templates:
 
 ```python
 # === DEFENSE_EI_PHASE: approach_press_target | align to button or target surface ===
@@ -203,7 +278,23 @@ increments, then release. Required phase order:
 - `release_articulation`
 - `retract_from_articulation`
 
-Pseudocode template:
+Phase success criteria for staged execution:
+
+- `approach_handle_or_lid`: the gripper is aligned with the handle, lid, edge,
+  or other articulated feature without disturbing the object.
+- `grasp_or_hook_articulation`: the gripper visibly grasps or hooks the
+  articulated feature securely enough to move it without slipping immediately.
+- `articulate_slowly`: the articulated object moves toward the requested
+  open/closed state through controlled increments without collision, overtravel,
+  or loss of contact.
+- `release_articulation`: the gripper releases the feature only after the object
+  appears to have reached the requested open/closed state, without rebounding
+  away from that state.
+- `retract_from_articulation`: the gripper retreats clear of the articulated
+  object; the object remains in the requested open/closed state for the atomic
+  task.
+
+Per-phase pseudocode templates:
 
 ```python
 # === DEFENSE_EI_PHASE: approach_handle_or_lid | align to articulated feature ===
@@ -235,7 +326,33 @@ phase order:
 - `return_or_release_source`
 - `retract_up`
 
-Pseudocode template:
+Phase success criteria for staged execution:
+
+- `approach_source_above`: the gripper is safely above and aligned with the
+  source container or object to be poured, without contacting or disturbing it
+  yet.
+- `grasp_source`: the gripper holds the correct source container securely enough
+  for lifting and tilting, without crushing, slipping, or tipping it
+  unintentionally.
+- `lift_to_pour_height`: the grasped source lifts to a safe pour height, clear
+  of the table, nearby objects, and the receiving container rim.
+- `transfer_above_target`: the source remains held while moving to a controlled
+  pose above the receiving target/opening, without spilling or colliding.
+- `tilt_to_pour`: the source tilts over the receiving target enough for pouring
+  while remaining positioned over the opening and avoiding spills outside the
+  target.
+- `hold_pour`: the source remains tilted long enough for the intended contents
+  to transfer into the receiving target if visible, without losing grasp
+  stability.
+- `untilt`: the source rotates back toward upright while still held securely,
+  with pouring stopped and no collision with the target rim.
+- `return_or_release_source`: the source is returned, placed, or released
+  according to the atomic task target state, with the gripper no longer applying
+  unintended force.
+- `retract_up`: the gripper retreats to a safe height without disturbing the
+  source or receiving target; the full `pour` atomic task target state holds.
+
+Per-phase pseudocode templates:
 
 ```python
 # === DEFENSE_EI_PHASE: approach_source_above | align above source container ===

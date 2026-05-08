@@ -6,8 +6,10 @@ tags: [defense_ei_agents, atomic, codegen, runtime, ur7e, real-robot]
 
 # Real-Robot Code Contract
 
-The code is executed on `UR7eVectorController`. There is no MuJoCo scene and no
-evobody dependency.
+The code is executed on `UR7eVectorController`. Generate code for exactly one
+requested phase of one atomic task; the orchestrator executes and judges that
+phase before requesting the next one. There is no MuJoCo scene and no evobody
+dependency.
 
 Allowed runtime APIs:
 - `move_x(distance, velocity=0.04, acceleration=0.18)`
@@ -33,10 +35,10 @@ Generation rules:
   motion. Do not call `move_ee`, `ee_pose`, `move_to`, or `print`; they are not
   available in generated-code runtime API.
 - If the atomic task names a primitive skill, follow `primitive-skill-contract`
-  for the required phase order and motion decomposition.
+  for the required phase order, but emit only the current requested phase.
 - Primitive skill names are labels, not runtime APIs. Do not call
   `pick_place`, `pick_and_place`, `push`, `pull`, `press`, `open`, `close`, or
-  `pour`; expand the primitive into low-level motion phases.
+  `pour`; expand the current requested phase into low-level motion commands.
 - Do not invent exact object coordinates from RGB images alone.
 - Use small relative motions, slow contact, and explicit gripper commands.
 - Overall motion must be slow enough to protect real objects. Prefer many small
@@ -50,7 +52,8 @@ Generation rules:
 - If the atomic task info includes a concrete 6D TCP pose vector, treat it only
   as contextual guidance. Do not call pose-reading or absolute-pose APIs from
   generated code.
-- If feedback says the previous attempt failed, address the specific failure.
+- If feedback says the previous attempt for this phase failed, address the
+  specific failure while preserving already completed phase state.
 
 Coordinate frame for axis-wise movement:
 
