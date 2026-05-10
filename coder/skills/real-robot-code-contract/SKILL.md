@@ -18,6 +18,11 @@ Allowed runtime APIs:
 - `rotate_x(angle_rad, velocity=0.04, acceleration=0.18)`
 - `rotate_y(angle_rad, velocity=0.04, acceleration=0.18)`
 - `rotate_z(angle_rad, velocity=0.04, acceleration=0.18)`
+- `look_at_operated_object(max_angle_rad=0.35, velocity=0.035, acceleration=0.14, max_refine_steps=3)`
+  - rotate wrist-camera/gripper +Z toward the detected operated-object grasp
+    region, immediately capture fresh RGB-D perception, and repeat small gaze
+    corrections until the wrist camera detects the operated object or the
+    bounded refine limit is reached.
 - `sleep(seconds)`
 - `gripper_control(value, delay)` - Robotiq command, 0=open and 255=closed; delay in ms.
 
@@ -32,8 +37,9 @@ Generation rules:
 - Use radians for every `rotate_x`/`rotate_y`/`rotate_z` rotation increment. Examples: `0.1745` is
   about 10 degrees and `1.5708` is about 90 degrees.
 - Use only the allowed axis-wise movement and rotation APIs for incremental arm
-  motion. Do not call `move_ee`, `ee_pose`, `move_to`, or `print`; they are not
-  available in generated-code runtime API.
+  motion plus `look_at_operated_object` for gaze. Do not call `move_ee`,
+  `ee_pose`, `move_to`, or `print`; they are not available in generated-code
+  runtime API.
 - If the atomic task names a primitive skill, follow `primitive-skill-contract`
   for the required phase order, but emit only the current requested phase.
 - Primitive skill names are labels, not runtime APIs. Do not call
@@ -46,6 +52,11 @@ Generation rules:
   perception. Use these only as direction and distance hints for bounded
   gripper-frame corrections. Split large offsets into small cautious moves and
   do not drive directly into contact based on depth alone.
+- For `pick_place`, call `look_at_operated_object(...)` near the end of the
+  first two approach phases only:
+  `approach_object_above_and_open_gripper` and
+  `descend_to_source_prepare_to_grasp`. Later phases may skip gaze because the
+  grasped object can occlude the wrist camera.
 - Overall motion must be slow enough to protect real objects. Prefer many small
   axis-wise increments and low `velocity`/`acceleration` over a single large move.
 - Near-object interaction phases must be slower than transit phases: approach,

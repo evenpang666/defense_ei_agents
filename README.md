@@ -44,13 +44,23 @@ export OPENAI_BASE_URL="https://api.qnaigc.com"
 export OPENAI_API_KEY="..."
 ```
 
-Optional embedding variables are currently accepted by the CLI for future memory/RAG use. The real workflow now runs with memory disabled, so these are not required:
+Optional embedding variables enable DefenseAgent memory/RAG. If no embedding
+settings are provided, the real workflow runs with memory disabled:
 
 ```bash
-export EMBEDDING_MODEL="text-embedding-3-small"
+export EMBEDDING_MODEL="qwen/qwen3-embedding-8b"
 export EMBEDDING_API_KEY="..."
-export EMBEDDING_BASE_URL="https://api.qnaigc.com"
+export EMBEDDING_BASE_URL="https://openrouter.ai/api/v1"
 export EMBEDDING_DIMS="1536"
+```
+
+The same settings can be passed on the command line:
+
+```bash
+--embedding-model text-embedding-3-small \
+--embedding-api-key "$LLM_API_KEY" \
+--embedding-base-url "$LLM_BASE_URL" \
+--embedding-dims 1536
 ```
 
 ## Dependencies
@@ -98,13 +108,25 @@ python evaluate_defense_agent_real.py --list-cameras
 
 If listing cameras reports access denied on Windows, close Intel RealSense Viewer or other camera apps and check Windows camera privacy permissions.
 
+If live capture fails with `Frame didn't arrive within 5000`, close RealSense
+Viewer or other camera apps, check both cameras are on USB3 ports, and try a
+more forgiving capture setup:
+
+```bash
+--camera-frame-timeout-ms 20000 \
+--camera-capture-retries 5 \
+--camera-width 640 \
+--camera-height 480 \
+--camera-fps 15
+```
+
 ## RGB-D Scene State
 
 The workflow now saves depth sidecars and a structured `scene_state.json` for
 the initial observation and every post-phase capture. The scene state is passed
 to both coder and judger as approximate support for object/grasp-region
-distances relative to the current gripper. Object estimation uses YOLO
-segmentation masks plus RealSense depth.
+distances relative to the current gripper. Object estimation uses YOLO masks or
+boxes plus RealSense depth.
 
 For calibrated base-frame coordinates, provide the fixed global-camera extrinsic:
 
@@ -122,17 +144,23 @@ The transform file should contain either a top-level 4x4 JSON array or
 global-camera transform is supplied, the run still saves RGB-D sidecars and
 camera-frame estimates, but base/gripper object coordinates are `null`.
 
-The wrist camera defaults to an approximate gripper transform with a `-0.02 m`
-offset along gripper Y. Override it with:
+The wrist camera defaults to an approximate gripper transform with offsets of
+`-0.04 m` along gripper Y and `-0.09 m` along gripper Z. Override it with:
 
 ```bash
 --wrist-camera-gripper-transform calibration/t_gripper_wrist_camera.json
 ```
 
-Use a YOLO segmentation model, not a detection-only model. For Ultralytics this
-means a `*-seg.pt` model or your own trained segmentation checkpoint. The mask
-pixels are combined with aligned depth, then converted into
-`objects[].grasp_region_center_gripper_mm`.
+By default, `--perception-backend yolo` stores and uses
+`checkpoints/yolo26n-seg.pt` when `--yolo-seg-model` is omitted. If you pass a
+bare Ultralytics model name such as `--yolo-seg-model yolo26n-seg.pt`, it is
+also copied or downloaded under `checkpoints/`, which is the default directory
+for all YOLO checkpoints used by this workflow. Segmentation models such as
+`*-seg.pt` are preferred because their masks produce cleaner local object point
+clouds, but detection-only models are also supported by estimating depth from
+the detected box region. The selected pixels are converted into a local RGB-D
+point cloud. The workflow reports both the object center and a point-cloud grasp
+reference in `objects[].grasp_region_center_gripper_mm`.
 
 To limit scene_state to specific YOLO classes, pass comma-separated labels:
 
@@ -147,25 +175,50 @@ tune thresholds with:
 --yolo-conf 0.35 --yolo-iou 0.5
 ```
 
+YOLO inference defaults to CPU because some Windows CUDA environments install a
+`torchvision` build without CUDA NMS support. If you see an error mentioning
+`torchvision::nms` and the `CUDA` backend, keep the default or pass:
+
+```bash
+--yolo-device cpu
+```
+
+After installing matching CUDA builds of `torch` and `torchvision`, you can opt
+back into GPU inference with `--yolo-device 0` or `--yolo-device cuda:0`.
+
 To create `calibration/t_base_global_camera.json`, use
 `calibrate_global_camera.py`. See
 [`docs/global_camera_calibration.md`](docs/global_camera_calibration.md) for the
 full step-by-step procedure.
 
-## Capture Images Only
+## Capture Perception Snapshot
 
-Use this to verify camera wiring without connecting to the robot:
+Use this to verify camera wiring and write a one-shot RGB-D perception snapshot
+without running planner/coder/judger or executing robot motion. The command
+connects to the robot by default to read the current TCP pose, so object
+positions include gripper-relative fields such as
+`grasp_region_center_gripper_mm`.
 
 ```bash
 python evaluate_defense_agent_real.py \
   --task "capture test" \
   --capture-only \
-  --camera-serials GLOBAL_SERIAL,WRIST_SERIAL
+  --camera-serials GLOBAL_SERIAL,WRIST_SERIAL \
+  --yolo-seg-model checkpoints/robot_yolo26n_seg.pt \
+  --yolo-target-labels cube,bowl
 ```
 
-The command writes `current_global_rgb.png`, `current_wrist_rgb.png`, depth
-sidecars, intrinsics JSON files, and `summary.json` under
-`logs/defense_agent_real/<timestamp>/`.
+The command writes these files under `logs/defense_agent_real/<timestamp>/`:
+
+- `current_global_rgb.png`, `current_wrist_rgb.png`: raw RGB images.
+- `current_global_yolo.png`, `current_wrist_yolo.png`: YOLO detection overlays when `--perception-backend yolo` is active.
+- `current_scene_state.json`: full object position/grasp-point scene state.
+- `current_object_positions.json`: compact per-object position JSON.
+- `*_depth_m.npy`, `*_depth_mm.png`, `*_depth_vis.png`: depth sidecars; `_depth_vis.png` is a colorized depth preview.
+- `*_point_cloud.ply`: sampled RGB-D point cloud in camera-frame meters.
+- `*_point_cloud_front.png`, `*_point_cloud_top.png`: point-cloud visualizations.
+- `summary.json`: paths to the generated artifacts and the TCP pose used for
+  gripper-relative coordinates.
 
 ## Run The Full Workflow
 
@@ -221,6 +274,13 @@ Each run creates a timestamped directory under `logs/defense_agent_real/` contai
   API validation for that phase
 - `atomic_XX/phase_NN_<slug>/attempt_YY/real_execution.json`: robot execution
   report for that phase
+- `atomic_XX/phase_NN_<slug>/attempt_YY/phase_start_robot_state.json`: joint,
+  TCP, and gripper snapshot saved immediately before executing that phase
+- `atomic_XX/phase_NN_<slug>/attempt_YY/restore_phase_start_robot_state.json`:
+  restore report written when the judger marks the phase attempt as `FAIL`
+- `atomic_XX/phase_NN_<slug>/attempt_YY/phase_NN_<slug>_gaze_refine_XX_*`:
+  closed-loop wrist-gaze captures created by `look_at_operated_object()` during
+  mandatory pick/place approach phases
 - `atomic_XX/phase_NN_<slug>/attempt_YY/phase_NN_<slug>_global_rgb.png` and
   `phase_NN_<slug>_wrist_rgb.png`: post-phase validation images, resized
   proportionally to 128 px wide

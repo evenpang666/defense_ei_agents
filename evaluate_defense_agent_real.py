@@ -6,6 +6,7 @@ import argparse
 import ast
 import asyncio
 import json
+import math
 import os
 import re
 import sys
@@ -44,7 +45,9 @@ for defense_agent_root in (
 from ur7e_controller import ROBOT_IP, UR7eVectorController, make_real_runtime_api  # noqa: E402
 from scene_perception import (  # noqa: E402
     RGBDFrame,
+    annotate_yolo_image,
     build_scene_state,
+    ensure_yolo_model_available,
     gripper_to_wrist_camera_transform,
     load_transform,
     scene_state_brief,
@@ -57,8 +60,15 @@ DEFAULT_SUPERVISOR_PROFILE = DEFAULT_PROFILE_ROOT / "supervisor" / "profile.yaml
 DEFAULT_CODER_PROFILE = DEFAULT_PROFILE_ROOT / "coder" / "profile.yaml"
 DEFAULT_JUDGER_PROFILE = DEFAULT_PROFILE_ROOT / "judger" / "profile.yaml"
 DEFAULT_LOG_ROOT = PROJECT_ROOT / "logs" / "defense_agent_real"
+DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
+DEFAULT_YOLO_MODEL_NAME = "yolo26n-seg.pt"
+DEFAULT_YOLO_MODEL = DEFAULT_CHECKPOINT_DIR / DEFAULT_YOLO_MODEL_NAME
+POINT_CLOUD_MIN_DEPTH_M = 0.02
+POINT_CLOUD_MAX_DEPTH_M = 6.0
+POINT_CLOUD_MAX_POINTS = 200000
 ALLOWED_RUNTIME_CALLS = {
     "gripper_control",
+    "look_at_operated_object",
     "move_x",
     "move_y",
     "move_z",
@@ -140,6 +150,94 @@ def _log(msg: str) -> None:
     print(f"[{stamp}] [evaluate_defense_agent_real] {msg}", flush=True)
 
 
+def _labels_from_task_for_yolo(task_text: str) -> list[str]:
+    color_words = ("red", "green", "blue", "yellow", "orange", "purple", "black", "white")
+    lowered = str(task_text or "").lower()
+    return [word for word in color_words if word in lowered]
+
+
+def _normalize_detection_label(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "null", "n/a", "unknown"}:
+        return ""
+    return text
+
+
+def _append_detection_label(labels: list[str], value: Any) -> None:
+    if isinstance(value, dict):
+        for key in ("name", "label", "object", "object_name", "description"):
+            if key in value:
+                _append_detection_label(labels, value.get(key))
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            _append_detection_label(labels, item)
+        return
+    label = _normalize_detection_label(value)
+    if label and label.lower() not in {existing.lower() for existing in labels}:
+        labels.append(label)
+
+
+def _yolo_labels_from_atomic_info(atomic_info: dict[str, Any], *, fallback_task: str = "") -> list[str]:
+    """Return supervisor-provided object names/classes to detect for coder/judger context."""
+    labels: list[str] = []
+    object_keys = (
+        "operated_object",
+        "source_object",
+        "target_object",
+        "target_region",
+        "task_related_objects",
+        "related_objects",
+        "other_task_related_objects",
+        "other_objects",
+        "obstacles",
+    )
+    for key in object_keys:
+        if key in atomic_info:
+            _append_detection_label(labels, atomic_info.get(key))
+    if not labels:
+        _append_detection_label(labels, _labels_from_task_for_yolo(fallback_task))
+    if not labels:
+        labels.append("object")
+    return labels
+
+
+def _ensure_yolo_checkpoint_in_default_dir(model_name: str) -> Path:
+    """Resolve or download a named Ultralytics checkpoint under checkpoints/."""
+    DEFAULT_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    clean_name = Path(str(model_name)).name
+    target = DEFAULT_CHECKPOINT_DIR / clean_name
+    if target.exists():
+        return target
+    source = Path(clean_name)
+    if source.exists():
+        import shutil
+
+        shutil.copy2(source, target)
+        return target
+    try:
+        from ultralytics.utils.downloads import attempt_download_asset
+    except ImportError as exc:
+        raise ImportError("Missing dependency 'ultralytics'. Install with: pip install ultralytics") from exc
+    old_cwd = Path.cwd()
+    try:
+        os.chdir(DEFAULT_CHECKPOINT_DIR)
+        downloaded = Path(str(attempt_download_asset(clean_name))).expanduser()
+    except Exception as exc:
+        raise RuntimeError(f"Unable to download YOLO checkpoint {clean_name}.") from exc
+    finally:
+        os.chdir(old_cwd)
+    if not downloaded.is_absolute():
+        downloaded = DEFAULT_CHECKPOINT_DIR / downloaded
+    if not downloaded.exists():
+        raise RuntimeError(f"Ultralytics did not return a valid YOLO checkpoint path for {clean_name}.")
+    if downloaded.resolve() != target.resolve():
+        import shutil
+
+        shutil.copy2(downloaded, target)
+    return target
+
+
 def _list_realsense_cameras() -> list[dict[str, str]]:
     try:
         import pyrealsense2 as rs
@@ -194,6 +292,8 @@ class RealSenseRGBPair:
         height: int,
         fps: int,
         warmup_frames: int,
+        frame_timeout_ms: int,
+        capture_retries: int,
     ) -> None:
         try:
             import numpy as np
@@ -211,8 +311,12 @@ class RealSenseRGBPair:
         self._height = int(height)
         self._fps = int(fps)
         self._warmup_frames = max(0, int(warmup_frames))
+        self._frame_timeout_ms = max(1000, int(frame_timeout_ms))
+        self._capture_retries = max(1, int(capture_retries))
         self._pipelines: list[Any] = []
         self._profiles: list[Any] = []
+        self._active_serials: list[str] = []
+        self._depth_filters: list[list[Any]] = []
         self._align_to_color = self._rs.align(self._rs.stream.color)
 
     def __enter__(self) -> "RealSenseRGBPair":
@@ -269,6 +373,9 @@ class RealSenseRGBPair:
                 ) from exc
             self._pipelines.append(pipeline)
             self._profiles.append(profile)
+            self._active_serials.append(serial)
+            self._configure_depth_sensor(profile.get_device().first_depth_sensor(), serial)
+            self._depth_filters.append(self._make_depth_filters())
 
         for _ in range(self._warmup_frames):
             self.capture()
@@ -282,6 +389,71 @@ class RealSenseRGBPair:
                 pass
         self._pipelines.clear()
         self._profiles.clear()
+        self._active_serials.clear()
+        self._depth_filters.clear()
+
+    def _set_sensor_option(self, sensor: Any, option: Any, value: float, label: str, serial: str) -> None:
+        try:
+            if hasattr(sensor, "supports") and not sensor.supports(option):
+                return
+            sensor.set_option(option, float(value))
+        except Exception as exc:
+            _log(f"RealSense depth option '{label}' was not applied for serial '{serial}': {exc}")
+
+    def _set_filter_option(self, filter_obj: Any, option: Any, value: float) -> None:
+        try:
+            if hasattr(filter_obj, "supports") and not filter_obj.supports(option):
+                return
+            filter_obj.set_option(option, float(value))
+        except Exception:
+            pass
+
+    def _configure_depth_sensor(self, depth_sensor: Any, serial: str) -> None:
+        rs = self._rs
+        option = rs.option
+        self._set_sensor_option(depth_sensor, option.visual_preset, 4, "visual_preset=high_density", serial)
+        self._set_sensor_option(depth_sensor, option.emitter_enabled, 1, "emitter_enabled", serial)
+        self._set_sensor_option(depth_sensor, option.enable_auto_exposure, 1, "enable_auto_exposure", serial)
+        try:
+            laser_range = depth_sensor.get_option_range(option.laser_power)
+            self._set_sensor_option(depth_sensor, option.laser_power, laser_range.max, "laser_power=max", serial)
+        except Exception as exc:
+            _log(f"RealSense laser power was not adjusted for serial '{serial}': {exc}")
+
+    def _make_depth_filters(self) -> list[Any]:
+        rs = self._rs
+        filters: list[Any] = []
+        try:
+            depth_to_disparity = rs.disparity_transform(True)
+            spatial = rs.spatial_filter()
+            temporal = rs.temporal_filter()
+            disparity_to_depth = rs.disparity_transform(False)
+            hole_filling = rs.hole_filling_filter()
+
+            self._set_filter_option(spatial, rs.option.filter_magnitude, 2)
+            self._set_filter_option(spatial, rs.option.filter_smooth_alpha, 0.5)
+            self._set_filter_option(spatial, rs.option.filter_smooth_delta, 20)
+            self._set_filter_option(spatial, rs.option.holes_fill, 3)
+            self._set_filter_option(temporal, rs.option.filter_smooth_alpha, 0.4)
+            self._set_filter_option(temporal, rs.option.filter_smooth_delta, 20)
+            self._set_filter_option(temporal, rs.option.persistence_control, 3)
+            self._set_filter_option(hole_filling, rs.option.holes_fill, 1)
+
+            filters.extend([depth_to_disparity, spatial, temporal, disparity_to_depth, hole_filling])
+        except Exception as exc:
+            _log(f"RealSense depth post-processing filters were not created: {exc}")
+        return filters
+
+    def _process_depth_frame(self, depth: Any, idx: int) -> Any:
+        processed = depth
+        for depth_filter in self._depth_filters[idx] if idx < len(self._depth_filters) else []:
+            try:
+                processed = depth_filter.process(processed)
+            except Exception as exc:
+                serial = self._active_serials[idx] if idx < len(self._active_serials) else f"camera_index_{idx}"
+                _log(f"RealSense depth filter failed for serial '{serial}': {exc}")
+                return depth
+        return processed
 
     def _discover_serials(self) -> list[str]:
         ctx = self._rs.context()
@@ -323,17 +495,42 @@ class RealSenseRGBPair:
         global_frame, wrist_frame = self.capture_rgbd()
         return global_frame.color, wrist_frame.color
 
+    def _wait_for_frames_with_retry(self, pipeline: Any, idx: int) -> Any:
+        serial = self._active_serials[idx] if idx < len(self._active_serials) else f"camera_index_{idx}"
+        last_error: Exception | None = None
+        for attempt in range(1, self._capture_retries + 1):
+            try:
+                return pipeline.wait_for_frames(self._frame_timeout_ms)
+            except RuntimeError as exc:
+                last_error = exc
+                _log(
+                    f"RealSense frame timeout for serial '{serial}' "
+                    f"(attempt {attempt}/{self._capture_retries}, timeout {self._frame_timeout_ms} ms): {exc}"
+                )
+                try:
+                    time.sleep(min(0.5 * attempt, 2.0))
+                except Exception:
+                    pass
+        raise RuntimeError(
+            f"RealSense frame did not arrive for serial '{serial}' after "
+            f"{self._capture_retries} attempt(s) with {self._frame_timeout_ms} ms timeout. "
+            "Close RealSense Viewer or other camera apps, check USB3 bandwidth/cables, "
+            "try explicit --camera-serials ordering, or lower --camera-width/--camera-height/--camera-fps."
+        ) from last_error
+
     def capture_rgbd(self) -> tuple[RGBDFrame, RGBDFrame]:
         if not self._pipelines:
             raise RuntimeError("RealSense pipelines are not started.")
 
         frames_out: list[RGBDFrame] = []
         for idx, pipeline in enumerate(self._pipelines):
-            frames = self._align_to_color.process(pipeline.wait_for_frames())
+            raw_frames = self._wait_for_frames_with_retry(pipeline, idx)
+            frames = self._align_to_color.process(raw_frames)
             color = frames.get_color_frame()
             depth = frames.get_depth_frame()
             if not color or not depth:
                 raise RuntimeError("Failed to read a RealSense RGB-D frame.")
+            depth = self._process_depth_frame(depth, idx)
 
             color_profile = color.profile.as_video_stream_profile()
             intr = color_profile.intrinsics
@@ -401,24 +598,198 @@ def _save_rgbd_sidecars(prefix_path: Path, frame: RGBDFrame) -> dict[str, str]:
     stem = prefix_path.with_suffix("")
     depth_npy = stem.parent / f"{stem.name}_depth_m.npy"
     depth_png = stem.parent / f"{stem.name}_depth_mm.png"
+    depth_vis = stem.parent / f"{stem.name}_depth_vis.png"
     intrinsics_path = stem.parent / f"{stem.name}_intrinsics.json"
     np.save(depth_npy, frame.depth_m)
     depth_mm = np.nan_to_num(frame.depth_m, nan=0.0, posinf=0.0, neginf=0.0)
     depth_mm = np.clip(depth_mm * 1000.0, 0.0, 65535.0).astype(np.uint16)
     imageio.imwrite(depth_png, depth_mm)
+    valid = np.isfinite(frame.depth_m) & (frame.depth_m > 0.0)
+    depth_vis_u8 = np.zeros(frame.depth_m.shape[:2], dtype=np.uint8)
+    if valid.any():
+        lo, hi = np.percentile(frame.depth_m[valid], [2.0, 98.0])
+        if hi <= lo:
+            hi = lo + 1e-6
+        scaled = (np.clip(frame.depth_m, lo, hi) - lo) / (hi - lo)
+        depth_vis_u8 = np.nan_to_num(scaled * 255.0, nan=0.0, posinf=255.0, neginf=0.0).astype(np.uint8)
+        depth_vis_u8[~valid] = 0
+    imageio.imwrite(depth_vis, _colorize_depth_u8(depth_vis_u8, valid))
     _save_json(
         intrinsics_path,
         {
             "intrinsics": frame.intrinsics,
             "depth_scale": frame.depth_scale,
             "serial": frame.serial,
-            "depth_units": "meters in .npy, millimeters in .png",
+            "depth_validity": _depth_validity_stats(
+                frame.depth_m,
+                min_depth_m=POINT_CLOUD_MIN_DEPTH_M,
+                max_depth_m=POINT_CLOUD_MAX_DEPTH_M,
+            ),
+            "depth_units": "meters in .npy, millimeters in _depth_mm.png; _depth_vis.png is contrast-stretched 8-bit for viewing",
         },
     )
     return {
         "depth_m_npy": str(depth_npy),
         "depth_mm_png": str(depth_png),
+        "depth_vis_png": str(depth_vis),
         "intrinsics": str(intrinsics_path),
+    }
+
+
+def _colorize_depth_u8(depth_u8: Any, valid_mask: Any) -> Any:
+    """Map an 8-bit depth image to a compact turbo-like RGB visualization."""
+    import numpy as np
+
+    x = np.asarray(depth_u8, dtype=np.float32) / 255.0
+    r = np.clip(1.5 - np.abs(4.0 * x - 3.0), 0.0, 1.0)
+    g = np.clip(1.5 - np.abs(4.0 * x - 2.0), 0.0, 1.0)
+    b = np.clip(1.5 - np.abs(4.0 * x - 1.0), 0.0, 1.0)
+    rgb = np.stack([r, g, b], axis=2)
+    rgb = (rgb * 255.0).astype(np.uint8)
+    rgb[~np.asarray(valid_mask, dtype=bool)] = np.array([0, 0, 0], dtype=np.uint8)
+    return rgb
+
+
+def _depth_validity_stats(depth: Any, *, min_depth_m: float, max_depth_m: float) -> dict[str, Any]:
+    import numpy as np
+
+    depth_np = np.asarray(depth, dtype=np.float64)
+    finite = np.isfinite(depth_np)
+    nonzero = finite & (depth_np > 0.0)
+    in_range = nonzero & (depth_np >= float(min_depth_m)) & (depth_np <= float(max_depth_m))
+    total = int(depth_np.size)
+    valid_values = depth_np[in_range]
+    stats: dict[str, Any] = {
+        "total_pixels": total,
+        "finite_pixels": int(finite.sum()),
+        "nonzero_pixels": int(nonzero.sum()),
+        "in_range_pixels": int(in_range.sum()),
+        "zero_or_invalid_pixels": int(total - nonzero.sum()),
+        "min_depth_m": float(min_depth_m),
+        "max_depth_m": float(max_depth_m),
+        "in_range_ratio": round(float(in_range.sum()) / float(total), 4) if total else 0.0,
+    }
+    if valid_values.size:
+        stats.update(
+            {
+                "depth_p01_m": round(float(np.percentile(valid_values, 1.0)), 4),
+                "depth_p50_m": round(float(np.percentile(valid_values, 50.0)), 4),
+                "depth_p99_m": round(float(np.percentile(valid_values, 99.0)), 4),
+            }
+        )
+    return stats
+
+
+def _rgbd_to_point_cloud(
+    frame: RGBDFrame,
+    *,
+    max_points: int = POINT_CLOUD_MAX_POINTS,
+    min_depth_m: float = POINT_CLOUD_MIN_DEPTH_M,
+    max_depth_m: float = POINT_CLOUD_MAX_DEPTH_M,
+) -> tuple[Any, Any]:
+    """Return sampled camera-frame XYZ points in meters and matching RGB colors."""
+    import numpy as np
+
+    intr = frame.intrinsics or {}
+    required = ("fx", "fy", "ppx", "ppy")
+    if any(key not in intr for key in required):
+        return np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.uint8)
+
+    depth = np.asarray(frame.depth_m, dtype=np.float64)
+    valid = np.isfinite(depth) & (depth >= float(min_depth_m)) & (depth <= float(max_depth_m))
+    ys, xs = np.where(valid)
+    if xs.size == 0:
+        return np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.uint8)
+    if xs.size > max_points:
+        rng = np.random.default_rng(0)
+        keep = np.sort(rng.choice(xs.size, size=int(max_points), replace=False))
+        xs = xs[keep]
+        ys = ys[keep]
+    zs = depth[ys, xs]
+    fx = float(intr["fx"])
+    fy = float(intr["fy"])
+    ppx = float(intr["ppx"])
+    ppy = float(intr["ppy"])
+    x = (xs.astype(np.float64) - ppx) / fx * zs
+    y = (ys.astype(np.float64) - ppy) / fy * zs
+    points = np.stack([x, y, zs], axis=1)
+    colors = np.asarray(frame.color, dtype=np.uint8)[ys, xs, :3]
+    return points, colors
+
+
+def _save_point_cloud_ply(path: Path, points: Any, colors: Any) -> None:
+    import numpy as np
+
+    pts = np.asarray(points, dtype=np.float64)
+    rgb = np.asarray(colors, dtype=np.uint8)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="ascii") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {pts.shape[0]}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+        for point, color in zip(pts, rgb):
+            f.write(
+                f"{point[0]:.6f} {point[1]:.6f} {point[2]:.6f} "
+                f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
+            )
+
+
+def _save_point_cloud_view(path: Path, points: Any, colors: Any, *, axes: tuple[int, int]) -> None:
+    import numpy as np
+
+    canvas_size = 900
+    canvas = np.full((canvas_size, canvas_size, 3), 18, dtype=np.uint8)
+    pts = np.asarray(points, dtype=np.float64)
+    rgb = np.asarray(colors, dtype=np.uint8)
+    if pts.shape[0] > 0:
+        a = pts[:, axes[0]]
+        b = pts[:, axes[1]]
+        finite = np.isfinite(a) & np.isfinite(b)
+        a = a[finite]
+        b = b[finite]
+        rgb = rgb[finite]
+        if a.size > 0:
+            a_lo, a_hi = np.percentile(a, [0.2, 99.8])
+            b_lo, b_hi = np.percentile(b, [0.2, 99.8])
+            if a_hi <= a_lo:
+                a_hi = a_lo + 1e-6
+            if b_hi <= b_lo:
+                b_hi = b_lo + 1e-6
+            u = np.clip(((a - a_lo) / (a_hi - a_lo) * (canvas_size - 1)).astype(np.int32), 0, canvas_size - 1)
+            v = np.clip(((1.0 - (b - b_lo) / (b_hi - b_lo)) * (canvas_size - 1)).astype(np.int32), 0, canvas_size - 1)
+            canvas[v, u] = rgb
+    path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.imwrite(path, canvas)
+
+
+def _save_point_cloud_artifacts(prefix_path: Path, frame: RGBDFrame) -> dict[str, Any]:
+    stem = prefix_path.with_suffix("")
+    ply_path = stem.parent / f"{stem.name}_point_cloud.ply"
+    front_view = stem.parent / f"{stem.name}_point_cloud_front.png"
+    top_view = stem.parent / f"{stem.name}_point_cloud_top.png"
+    points, colors = _rgbd_to_point_cloud(frame)
+    _save_point_cloud_ply(ply_path, points, colors)
+    _save_point_cloud_view(front_view, points, colors, axes=(0, 1))
+    _save_point_cloud_view(top_view, points, colors, axes=(0, 2))
+    return {
+        "point_cloud_ply": str(ply_path),
+        "point_cloud_front_png": str(front_view),
+        "point_cloud_top_png": str(top_view),
+        "point_count": int(getattr(points, "shape", [0])[0]),
+        "depth_validity": _depth_validity_stats(
+            frame.depth_m,
+            min_depth_m=POINT_CLOUD_MIN_DEPTH_M,
+            max_depth_m=POINT_CLOUD_MAX_DEPTH_M,
+        ),
+        "frame": "camera",
+        "units": "meters",
     }
 
 
@@ -428,12 +799,110 @@ def _write_rgbd_observation(
     wrist_path: Path,
     global_frame: RGBDFrame,
     wrist_frame: RGBDFrame,
+    perception_backend: str = "none",
+    yolo_model_path: str | None = None,
+    yolo_confidence: float = 0.35,
+    yolo_iou: float = 0.5,
+    yolo_target_labels: Sequence[str] | None = None,
+    yolo_device: str | None = "cpu",
 ) -> dict[str, Any]:
-    imageio.imwrite(global_path, global_frame.color)
-    imageio.imwrite(wrist_path, wrist_frame.color)
+    backend = str(perception_backend).strip().lower()
+    if backend == "yolo":
+        global_image = annotate_yolo_image(
+            frame=global_frame,
+            model_path=yolo_model_path,
+            confidence=float(yolo_confidence),
+            iou=float(yolo_iou),
+            target_labels=yolo_target_labels or [],
+            device=yolo_device,
+        )
+        wrist_image = annotate_yolo_image(
+            frame=wrist_frame,
+            model_path=yolo_model_path,
+            confidence=float(yolo_confidence),
+            iou=float(yolo_iou),
+            target_labels=yolo_target_labels or [],
+            device=yolo_device,
+        )
+    else:
+        global_image = global_frame.color
+        wrist_image = wrist_frame.color
+    imageio.imwrite(global_path, global_image)
+    imageio.imwrite(wrist_path, wrist_image)
     return {
         "global": _save_rgbd_sidecars(global_path, global_frame),
         "wrist": _save_rgbd_sidecars(wrist_path, wrist_frame),
+        "agent_images": {
+            "global_image": str(global_path),
+            "wrist_image": str(wrist_path),
+            "annotation": "YOLO boxes and labels" if backend == "yolo" else "raw RGB",
+        },
+    }
+
+
+def _write_capture_only_observation(
+    *,
+    run_dir: Path,
+    global_frame: RGBDFrame,
+    wrist_frame: RGBDFrame,
+    perception_backend: str,
+    yolo_model_path: str | None,
+    yolo_confidence: float,
+    yolo_iou: float,
+    yolo_target_labels: Sequence[str] | None,
+    yolo_device: str | None,
+) -> dict[str, Any]:
+    current_global = run_dir / "current_global_rgb.png"
+    current_wrist = run_dir / "current_wrist_rgb.png"
+    imageio.imwrite(current_global, global_frame.color)
+    imageio.imwrite(current_wrist, wrist_frame.color)
+
+    sidecars = {
+        "global": _save_rgbd_sidecars(current_global, global_frame),
+        "wrist": _save_rgbd_sidecars(current_wrist, wrist_frame),
+    }
+    point_clouds = {
+        "global": _save_point_cloud_artifacts(current_global, global_frame),
+        "wrist": _save_point_cloud_artifacts(current_wrist, wrist_frame),
+    }
+
+    detections: dict[str, str] = {}
+    if str(perception_backend).strip().lower() == "yolo":
+        global_yolo = run_dir / "current_global_yolo.png"
+        wrist_yolo = run_dir / "current_wrist_yolo.png"
+        imageio.imwrite(
+            global_yolo,
+            annotate_yolo_image(
+                frame=global_frame,
+                model_path=yolo_model_path,
+                confidence=float(yolo_confidence),
+                iou=float(yolo_iou),
+                target_labels=yolo_target_labels or [],
+                device=yolo_device,
+            ),
+        )
+        imageio.imwrite(
+            wrist_yolo,
+            annotate_yolo_image(
+                frame=wrist_frame,
+                model_path=yolo_model_path,
+                confidence=float(yolo_confidence),
+                iou=float(yolo_iou),
+                target_labels=yolo_target_labels or [],
+                device=yolo_device,
+            ),
+        )
+        detections = {
+            "global_yolo_image": str(global_yolo),
+            "wrist_yolo_image": str(wrist_yolo),
+        }
+
+    return {
+        "global_image": str(current_global),
+        "wrist_image": str(current_wrist),
+        "rgbd_sidecars": sidecars,
+        "point_clouds": point_clouds,
+        "detection_images": detections,
     }
 
 
@@ -540,14 +1009,31 @@ def _resolve_memory_backend_from_profile(
     from DefenseAgent.memory import MemoryBackendConfig
 
     profile = AgentProfile.from_yaml(profile_path)
-    llm_provider = (profile.llm.provider or "").strip().lower()
-    llm_model = (profile.llm.model or "").strip()
-    llm_api_key = (profile.llm.api_key or "").strip()
-    llm_base_url = (profile.llm.base_url or "").strip()
+    llm_provider = (
+        (profile.llm.provider or "").strip()
+        or os.environ.get("AGENT_LAB_LLM_PROVIDER", "").strip()
+        or os.environ.get("LLM_PROVIDER", "").strip()
+        or os.environ.get("OPENAI_PROVIDER", "").strip()
+    ).lower()
+    llm_model = (
+        (profile.llm.model or "").strip()
+        or os.environ.get("LLM_MODEL_ID", "").strip()
+        or os.environ.get("OPENAI_MODEL", "").strip()
+    )
+    llm_api_key = (
+        (profile.llm.api_key or "").strip()
+        or os.environ.get("LLM_API_KEY", "").strip()
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+    )
+    llm_base_url = (
+        (profile.llm.base_url or "").strip()
+        or os.environ.get("LLM_BASE_URL", "").strip()
+        or os.environ.get("OPENAI_BASE_URL", "").strip()
+    )
 
     if not llm_provider or not llm_model or not llm_api_key:
         raise ValueError(
-            f"coder profile llm config incomplete in {profile_path}; "
+            f"profile llm config incomplete in {profile_path}; "
             "need provider/model/api_key for mem0 backend."
         )
 
@@ -562,6 +1048,13 @@ def _resolve_memory_backend_from_profile(
         embedding_base_url=(embedding_base_url or "").strip() or llm_base_url,
         embedding_dims=int(embedding_dims),
     )
+
+
+def _default_embedding_dims(embedding_model: str) -> int:
+    model = embedding_model.strip().lower()
+    if model == "text-embedding-3-large":
+        return 3072
+    return 1536
 
 
 def _build_react_agent(
@@ -671,7 +1164,186 @@ def _check_generated_code(code: str) -> dict[str, Any]:
     return runtime_report
 
 
-def _safe_real_exec_globals(controller: UR7eVectorController) -> dict[str, Any]:
+def _object_vector_gripper_mm(
+    scene_state: dict[str, Any] | None,
+    atomic_info: dict[str, Any] | None,
+) -> list[float] | None:
+    if not isinstance(scene_state, dict):
+        return None
+    objects = scene_state.get("objects")
+    wrist_objects = scene_state.get("wrist_objects")
+    if not isinstance(objects, list) and not isinstance(wrist_objects, list):
+        return None
+    operated = str((atomic_info or {}).get("operated_object") or (atomic_info or {}).get("source_object") or "").strip().lower()
+    candidates: list[dict[str, Any]] = []
+    ordered_objects: list[Any] = []
+    if isinstance(wrist_objects, list):
+        ordered_objects.extend(wrist_objects)
+    if isinstance(objects, list):
+        ordered_objects.extend(objects)
+    for obj in ordered_objects:
+        if not isinstance(obj, dict) or str(obj.get("status", "")).lower() == "not_detected":
+            continue
+        label = str(obj.get("label", "")).strip().lower()
+        if operated and (operated in label or label in operated):
+            candidates.insert(0, obj)
+        else:
+            candidates.append(obj)
+    for obj in candidates:
+        raw = obj.get("grasp_region_center_gripper_mm") or obj.get("center_gripper_mm")
+        if isinstance(raw, list) and len(raw) >= 3:
+            try:
+                return [float(raw[0]), float(raw[1]), float(raw[2])]
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _wrist_object_vector_gripper_mm(
+    scene_state: dict[str, Any] | None,
+    atomic_info: dict[str, Any] | None,
+) -> list[float] | None:
+    if not isinstance(scene_state, dict):
+        return None
+    objects = scene_state.get("wrist_objects")
+    if not isinstance(objects, list):
+        return None
+    operated = str((atomic_info or {}).get("operated_object") or (atomic_info or {}).get("source_object") or "").strip().lower()
+    candidates: list[dict[str, Any]] = []
+    for obj in objects:
+        if not isinstance(obj, dict) or str(obj.get("status", "")).lower() == "not_detected":
+            continue
+        label = str(obj.get("label", "")).strip().lower()
+        if operated and (operated in label or label in operated):
+            candidates.insert(0, obj)
+        else:
+            candidates.append(obj)
+    for obj in candidates:
+        raw = obj.get("grasp_region_center_gripper_mm") or obj.get("center_gripper_mm")
+        if isinstance(raw, list) and len(raw) >= 3:
+            try:
+                return [float(raw[0]), float(raw[1]), float(raw[2])]
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+class _RuntimeLookAtContext:
+    def __init__(
+        self,
+        controller: UR7eVectorController,
+        scene_state: dict[str, Any] | None,
+        atomic_info: dict[str, Any] | None,
+        gaze_refine_fn: Callable[[int], dict[str, Any] | None] | None = None,
+    ) -> None:
+        self.controller = controller
+        self.scene_state = scene_state
+        self.atomic_info = atomic_info
+        self.gaze_refine_fn = gaze_refine_fn
+        self.object_vector_mm = _object_vector_gripper_mm(scene_state, atomic_info)
+        self.object_held = False
+
+    def _translate_object_vector(self, dx: float, dy: float, dz: float) -> None:
+        if self.object_vector_mm is None or self.object_held:
+            return
+        self.object_vector_mm = [
+            self.object_vector_mm[0] - float(dx),
+            self.object_vector_mm[1] - float(dy),
+            self.object_vector_mm[2] - float(dz),
+        ]
+
+    def _rotate_object_vector_after_tool_delta(self, droll: float, dpitch: float) -> None:
+        if self.object_vector_mm is None:
+            return
+        x, y, z = [float(v) for v in self.object_vector_mm[:3]]
+        cy = math.cos(float(dpitch))
+        sy = math.sin(float(dpitch))
+        x1 = cy * x - sy * z
+        y1 = y
+        z1 = sy * x + cy * z
+        cx = math.cos(float(droll))
+        sx = math.sin(float(droll))
+        self.object_vector_mm = [
+            x1,
+            cx * y1 + sx * z1,
+            -sx * y1 + cx * z1,
+        ]
+
+    def move_x(self, distance: float = 50.0, velocity: float = 0.04, acceleration: float = 0.18) -> None:
+        self.controller.move_x(distance, velocity=velocity, acceleration=acceleration)
+        self._translate_object_vector(float(distance), 0.0, 0.0)
+
+    def move_y(self, distance: float = 50.0, velocity: float = 0.04, acceleration: float = 0.18) -> None:
+        self.controller.move_y(distance, velocity=velocity, acceleration=acceleration)
+        self._translate_object_vector(0.0, float(distance), 0.0)
+
+    def move_z(self, distance: float = 50.0, velocity: float = 0.04, acceleration: float = 0.18) -> None:
+        self.controller.move_z(distance, velocity=velocity, acceleration=acceleration)
+        self._translate_object_vector(0.0, 0.0, float(distance))
+
+    def gripper_control(self, value: float, delay: int = 50) -> None:
+        self.controller.gripper_control(value, delay)
+        self.object_held = float(value) >= 127.0
+
+    def look_at_operated_object(
+        self,
+        max_angle_rad: float = 0.35,
+        velocity: float = 0.035,
+        acceleration: float = 0.14,
+        max_refine_steps: int = 3,
+    ) -> None:
+        max_angle = max(0.01, min(abs(float(max_angle_rad)), 0.6))
+        refine_steps = max(1, min(int(max_refine_steps), 5))
+        for refine_idx in range(refine_steps):
+            vector = self.object_vector_mm
+            if vector is None:
+                if self.gaze_refine_fn is None:
+                    return
+                refreshed = self.gaze_refine_fn(refine_idx + 1)
+                if isinstance(refreshed, dict):
+                    self.scene_state = refreshed
+                    self.object_vector_mm = _object_vector_gripper_mm(refreshed, self.atomic_info)
+                if self.object_vector_mm is None:
+                    return
+                vector = self.object_vector_mm
+
+            x, y, z = [float(v) for v in vector[:3]]
+            if (x * x + y * y + z * z) ** 0.5 < 1e-6:
+                return
+            safe_z = z if abs(z) > 1e-6 else (1e-6 if z >= 0 else -1e-6)
+            yaw_to_x = max(-max_angle, min(max_angle, math.atan2(x, safe_z)))
+            pitch_to_y = max(-max_angle, min(max_angle, -math.atan2(y, (x * x + z * z) ** 0.5)))
+            applied_yaw = yaw_to_x if abs(yaw_to_x) > 0.01 else 0.0
+            applied_pitch = pitch_to_y if abs(pitch_to_y) > 0.01 else 0.0
+            if applied_yaw:
+                self.controller.rotate_y(applied_yaw, velocity=velocity, acceleration=acceleration)
+            if applied_pitch:
+                self.controller.rotate_x(applied_pitch, velocity=velocity, acceleration=acceleration)
+            self._rotate_object_vector_after_tool_delta(applied_pitch, applied_yaw)
+            time.sleep(0.2)
+
+            if self.gaze_refine_fn is None:
+                return
+            refreshed = self.gaze_refine_fn(refine_idx + 1)
+            if not isinstance(refreshed, dict):
+                return
+            self.scene_state = refreshed
+            wrist_vector = _wrist_object_vector_gripper_mm(refreshed, self.atomic_info)
+            self.object_vector_mm = wrist_vector or _object_vector_gripper_mm(refreshed, self.atomic_info)
+            if wrist_vector is None:
+                continue
+            wx, wy, wz = [float(v) for v in wrist_vector[:3]]
+            wz_safe = wz if abs(wz) > 1e-6 else 1e-6
+            if abs(math.atan2(wx, wz_safe)) <= 0.06 and abs(math.atan2(wy, wz_safe)) <= 0.06:
+                return
+
+
+def _safe_real_exec_globals(
+    controller: UR7eVectorController,
+    scene_state: dict[str, Any] | None = None,
+    atomic_info: dict[str, Any] | None = None,
+    gaze_refine_fn: Callable[[int], dict[str, Any] | None] | None = None,
+) -> dict[str, Any]:
     safe_builtins = {
         "range": range,
         "len": len,
@@ -694,6 +1366,16 @@ def _safe_real_exec_globals(controller: UR7eVectorController) -> dict[str, Any]:
     }
     exec_globals: dict[str, Any] = {"__builtins__": safe_builtins}
     exec_globals.update(make_real_runtime_api(controller))
+    look_context = _RuntimeLookAtContext(controller, scene_state, atomic_info, gaze_refine_fn=gaze_refine_fn)
+    exec_globals.update(
+        {
+            "look_at_operated_object": look_context.look_at_operated_object,
+            "gripper_control": look_context.gripper_control,
+            "move_x": look_context.move_x,
+            "move_y": look_context.move_y,
+            "move_z": look_context.move_z,
+        }
+    )
     return exec_globals
 
 
@@ -770,16 +1452,35 @@ def _resize_image_file_width(path: Path, target_width: int = 128) -> None:
     imageio.imwrite(path, resized)
 
 
+def _image_width_px(path: Path) -> int | None:
+    try:
+        image = imageio.imread(path)
+    except Exception:
+        return None
+    shape = getattr(image, "shape", None)
+    if shape is None or len(shape) < 2:
+        return None
+    return int(shape[1])
+
+
 def _execute_real_code(
     *,
     code: str,
     controller: UR7eVectorController | None,
+    scene_state: dict[str, Any] | None = None,
+    atomic_info: dict[str, Any] | None = None,
+    gaze_refine_fn: Callable[[int], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     _check_generated_code(code)
     if controller is None:
         raise RuntimeError("controller is required for real execution")
 
-    exec_globals = _safe_real_exec_globals(controller)
+    exec_globals = _safe_real_exec_globals(
+        controller,
+        scene_state=scene_state,
+        atomic_info=atomic_info,
+        gaze_refine_fn=gaze_refine_fn,
+    )
 
     started = time.time()
     try:
@@ -851,7 +1552,7 @@ def _execute_real_code_by_phase(
                 phase_report["wrist_image"] = str(wrist_path)
                 phase_report["global_rgb"] = str(global_path)
                 phase_report["wrist_rgb"] = str(wrist_path)
-                phase_report["image_width_px"] = 128
+                phase_report["image_width_px"] = _image_width_px(global_path)
             except Exception:
                 phase_report["capture_error"] = traceback.format_exc()
 
@@ -925,16 +1626,22 @@ def _capture_or_copy_images(
 
 def _capture_or_copy_observation(
     *,
-    capture_observation_fn: Callable[[Path, Path, Path], dict[str, Any]] | None,
+    capture_observation_fn: Callable[..., dict[str, Any]] | None,
     capture_images_fn: Callable[[Path, Path], None] | None,
     target_global: Path,
     target_wrist: Path,
     target_scene_state: Path,
+    yolo_target_labels: Sequence[str] | None = None,
     resize_width: int | None = None,
 ) -> dict[str, Any] | None:
     target_global.parent.mkdir(parents=True, exist_ok=True)
     if capture_observation_fn is not None:
-        scene_state = capture_observation_fn(target_global, target_wrist, target_scene_state)
+        scene_state = capture_observation_fn(
+            target_global,
+            target_wrist,
+            target_scene_state,
+            yolo_target_labels=yolo_target_labels,
+        )
         if resize_width is not None:
             _resize_image_file_width(target_global, resize_width)
             _resize_image_file_width(target_wrist, resize_width)
@@ -970,57 +1677,39 @@ def _primitive_name(atomic_info: dict[str, Any]) -> str:
 
 def _primitive_phase_specs(atomic_info: dict[str, Any]) -> list[PrimitivePhaseSpec]:
     primitive = _primitive_name(atomic_info)
+    grasp_reference = str(atomic_info.get("grasp_point_reference", "")).strip()
+    target_reference = str(atomic_info.get("target_point_reference", "")).strip()
     phase_specs_by_primitive: dict[str, list[tuple[str, str, str]]] = {
         "pick_place": [
             (
-                "point_down",
-                "orient gripper downwards",
-                "The wrist/global views should show the gripper oriented for a vertical-down approach to the table/object, with no object contact or collision.",
+                "approach_object_above_and_open_gripper",
+                "approach above grasp reference and open gripper",
+                "The gripper should move to a safe pose above the operated object's grasp reference, open enough for the object, and must finish with wrist_image detecting the operated object after closed-loop gaze.",
             ),
             (
-                "approach_source_above",
-                "align above source using small wrist-frame corrections",
-                "The gripper should be safely above the operated object, laterally aligned for grasping while still clear of the object and surrounding clutter.",
+                "descend_to_source_prepare_to_grasp",
+                "descend to grasp reference before closing",
+                "The gripper should descend slowly toward the operated object's grasp reference, remain open and aligned for grasping, avoid pushing it away, and must finish with wrist_image detecting the operated object after closed-loop gaze.",
             ),
             (
-                "open_gripper",
-                "prepare for grasp",
-                "The gripper fingers should be visibly open enough to fit around the operated object, and the gripper should remain above the source without disturbing it.",
+                "grasp_and_lift_to_safe_height",
+                "grasp object and lift before horizontal transfer",
+                "The gripper should close on the correct object with a stable grasp and lift it to a safe carry height clear of the table, source area, rims, and any intervening obstacles.",
             ),
             (
-                "descend_to_source",
-                "slow vertical descent to source grasp height",
-                "The gripper should descend vertically to the object's grasp height, remain aligned around or immediately beside the object, and avoid pushing it away.",
-            ),
-            (
-                "grasp_source",
-                "close on object and settle",
-                "The gripper should be closed on the correct object with a stable grasp; the object should not be visibly missed, knocked over, or squeezed out.",
-            ),
-            (
-                "lift_to_safe_height",
-                "lift before horizontal transfer",
-                "The grasped object should rise with the gripper to a safe carry height, clear of the table, source area, rims, and any intervening obstacles.",
-            ),
-            (
-                "transfer_above_target",
+                "transfer_object_to_target_above",
                 "horizontal transfer at safe height",
-                "With the object still held, the gripper should move horizontally to a position above the target region/opening while staying at safe height.",
+                "With the object still held, the gripper should move horizontally to a pose above the target point reference while staying at safe height.",
             ),
             (
-                "descend_to_target",
-                "slow vertical placement",
-                "The held object should descend vertically into or onto the target placement region without hitting rims, obstacles, or missing the target.",
+                "descend_to_target_position_and_release",
+                "descend to target reference and release",
+                "The held object should descend vertically into or onto the target point reference, avoid rims/obstacles, and open the gripper to release cleanly.",
             ),
             (
-                "release_at_target",
-                "release object",
-                "The gripper should open and leave the correct object at the target position; the object should no longer be held and should not roll or fall out of place.",
-            ),
-            (
-                "retract_up",
-                "retreat vertically",
-                "The gripper should retract vertically to a safe height without disturbing the placed object; the full pick_place atomic task target state should now hold.",
+                "move_to_safe_height",
+                "retreat to safe height",
+                "The gripper should retract to a safe height without disturbing the placed object; the full pick_place target state should hold.",
             ),
         ],
         "push": [
@@ -1209,10 +1898,71 @@ def _primitive_phase_specs(atomic_info: dict[str, Any]) -> list[PrimitivePhaseSp
     if primitive == "pick_and_place":
         primitive = "pick_place"
     entries = phase_specs_by_primitive.get(primitive, [])
-    return [
-        PrimitivePhaseSpec(index, slug, goal, success_criteria)
-        for index, (slug, goal, success_criteria) in enumerate(entries, start=1)
-    ]
+    if entries and primitive != "pick_place":
+        entries = [
+            (
+                "look_at_operated_object",
+                "aim wrist camera at operated object",
+                "The wrist camera view must clearly include the operated object before any manipulation phase begins; the gripper should remain clear of the scene with no object contact or collision.",
+            ),
+            *entries,
+        ]
+    specs: list[PrimitivePhaseSpec] = []
+    for index, (slug, goal, success_criteria) in enumerate(entries, start=1):
+        point_constraints: list[str] = []
+        if grasp_reference and slug in {
+            "look_at_operated_object",
+            "approach_object_above_and_open_gripper",
+            "descend_to_source_prepare_to_grasp",
+            "grasp_and_lift_to_safe_height",
+            "approach_source_above",
+            "open_gripper",
+            "descend_to_source",
+            "grasp_source",
+            "approach_push_start",
+            "descend_or_advance_to_contact",
+            "approach_pull_contact",
+            "grasp_or_hook",
+            "approach_press_target",
+            "press_slowly",
+            "approach_handle_or_lid",
+            "grasp_or_hook_articulation",
+        }:
+            point_constraints.append(f"grasp/contact reference: {grasp_reference}")
+        if target_reference and slug in {
+            "transfer_object_to_target_above",
+            "descend_to_target_position_and_release",
+            "transfer_above_target",
+            "descend_to_target_and_release",
+            "descend_to_target",
+            "release_at_target",
+            "push_slowly",
+            "pull_slowly",
+            "press_slowly",
+            "hold_press",
+            "articulate_slowly",
+            "tilt_to_pour",
+            "hold_pour",
+            "return_or_release_source",
+        }:
+            point_constraints.append(f"target reference: {target_reference}")
+        if point_constraints:
+            success_criteria = f"{success_criteria} Respect point constraints: {'; '.join(point_constraints)}."
+        if primitive == "pick_place" and slug in {
+            "approach_object_above_and_open_gripper",
+            "descend_to_source_prepare_to_grasp",
+        }:
+            success_criteria = (
+                f"{success_criteria} Closed-loop gaze is mandatory: after look_at_operated_object(), "
+                "the wrist_camera/wrist_image must detect the operated object."
+            )
+        elif primitive != "pick_place" and index > 1:
+            success_criteria = (
+                f"{success_criteria} The wrist_camera/wrist_image for this phase must still contain "
+                "the operated object unless the object has already been intentionally released at the target."
+            )
+        specs.append(PrimitivePhaseSpec(index, slug, goal, success_criteria))
+    return specs
 
 
 def _phase_history_for_prompt(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1264,20 +2014,75 @@ async def run_defense_agent_real_once(
     log_dir: Path,
     controller: UR7eVectorController,
     max_steps: int | None,
-    max_attempts_per_atomic: int,
-    embedding_model: str,
+    max_attempts_per_atomic: int | None,
+    embedding_model: str | None,
     embedding_api_key: str | None,
     embedding_base_url: str | None,
-    embedding_dims: int,
+    embedding_dims: int | None,
     capture_images_fn: Callable[[Path, Path], None] | None = None,
-    capture_observation_fn: Callable[[Path, Path, Path], dict[str, Any]] | None = None,
+    capture_observation_fn: Callable[..., dict[str, Any]] | None = None,
 ) -> RealDefenseOutputs:
-    del embedding_model, embedding_api_key, embedding_base_url, embedding_dims
-
-    planner = _build_react_agent(planner_profile, enable_memory=False)
-    supervisor = _build_react_agent(supervisor_profile, enable_memory=False)
-    coder = _build_react_agent(coder_profile, enable_memory=False)
-    judger = _build_react_agent(judger_profile, enable_memory=False)
+    memory_enabled = any(
+        value not in (None, "")
+        for value in (embedding_model, embedding_api_key, embedding_base_url, embedding_dims)
+    )
+    if memory_enabled:
+        resolved_embedding_model = (embedding_model or "text-embedding-3-small").strip()
+        resolved_embedding_dims = embedding_dims or _default_embedding_dims(resolved_embedding_model)
+        _log(
+            "DefenseAgent memory enabled "
+            f"(embedding_model={resolved_embedding_model}, embedding_dims={resolved_embedding_dims})."
+        )
+        planner = _build_react_agent(
+            planner_profile,
+            enable_memory=True,
+            memory_backend=_resolve_memory_backend_from_profile(
+                planner_profile,
+                embedding_model=resolved_embedding_model,
+                embedding_api_key=embedding_api_key,
+                embedding_base_url=embedding_base_url,
+                embedding_dims=resolved_embedding_dims,
+            ),
+        )
+        supervisor = _build_react_agent(
+            supervisor_profile,
+            enable_memory=True,
+            memory_backend=_resolve_memory_backend_from_profile(
+                supervisor_profile,
+                embedding_model=resolved_embedding_model,
+                embedding_api_key=embedding_api_key,
+                embedding_base_url=embedding_base_url,
+                embedding_dims=resolved_embedding_dims,
+            ),
+        )
+        coder = _build_react_agent(
+            coder_profile,
+            enable_memory=True,
+            memory_backend=_resolve_memory_backend_from_profile(
+                coder_profile,
+                embedding_model=resolved_embedding_model,
+                embedding_api_key=embedding_api_key,
+                embedding_base_url=embedding_base_url,
+                embedding_dims=resolved_embedding_dims,
+            ),
+        )
+        judger = _build_react_agent(
+            judger_profile,
+            enable_memory=True,
+            memory_backend=_resolve_memory_backend_from_profile(
+                judger_profile,
+                embedding_model=resolved_embedding_model,
+                embedding_api_key=embedding_api_key,
+                embedding_base_url=embedding_base_url,
+                embedding_dims=resolved_embedding_dims,
+            ),
+        )
+    else:
+        _log("DefenseAgent memory disabled; no embedding parameters were provided.")
+        planner = _build_react_agent(planner_profile, enable_memory=False)
+        supervisor = _build_react_agent(supervisor_profile, enable_memory=False)
+        coder = _build_react_agent(coder_profile, enable_memory=False)
+        judger = _build_react_agent(judger_profile, enable_memory=False)
 
     initial_robot_state = _snapshot_robot_initial_state(controller)
     _save_json(log_dir / "initial_robot_state.json", initial_robot_state)
@@ -1286,43 +2091,29 @@ async def run_defense_agent_real_once(
         if current_scene_state is not None and current_scene_state.exists()
         else None
     )
-    current_scene_state_brief = (
-        scene_state_brief(current_scene_state_payload)
-        if isinstance(current_scene_state_payload, dict)
-        else None
-    )
 
     observation = {
         "environment": "real_robot",
         "robot": "UR7e",
         "cameras": {
             "global_image": str(current_global_image),
-            "wrist_image": str(current_wrist_image),
-            "global_rgb": str(current_global_image),
-            "wrist_rgb": str(current_wrist_image),
-            "scene_state": str(current_scene_state) if current_scene_state is not None else None,
         },
         "image_roles": {
-            "global_image": "Global camera image showing the whole scene.",
-            "wrist_image": (
-                "Wrist camera image from the gripper viewpoint; part of the gripper "
-                "may appear along the bottom of the image."
-            ),
+            "global_image": "Single fixed global camera image captured before planner execution and shared by planner and supervisor.",
         },
         "runtime_note": (
             "This is a real-robot one-pass validation. The visual state inputs are "
-            "global_image and wrist_image Intel RealSense RGB images. When available, "
-            "scene_state contains RGB-D object position estimates relative to the "
-            "UR base and current gripper; use them as approximate guidance, not as "
-            "a replacement for cautious phase-wise motion."
+            "a single pre-planner global_image for planner and supervisor. Coder and "
+            "judger receive fresh phase-local YOLO detections after supervisor names "
+            "the operated object, target object, and related task objects."
         ),
-        "scene_state_brief": current_scene_state_brief,
     }
     coder_contracts = {
         "runtime_api": {
             "allowed_calls": sorted(ALLOWED_RUNTIME_CALLS),
             "allowed_builtins": sorted(ALLOWED_BUILTIN_CALLS),
             "forbidden_calls": sorted(FORBIDDEN_RUNTIME_CALLS),
+            "look_at_operated_object": "look_at_operated_object(max_angle_rad=0.35, velocity=0.035, acceleration=0.14, max_refine_steps=3); rotates gripper/wrist-camera +Z, immediately captures fresh RGB-D/YOLO perception, and repeats bounded micro-adjustments until wrist_image detects the operated object or the refine limit is reached.",
             "move_x": "move_x(distance, velocity=0.04, acceleration=0.18); distance is millimeters in gripper/wrist-image +X.",
             "move_y": "move_y(distance, velocity=0.04, acceleration=0.18); distance is millimeters in gripper/wrist-image +Y.",
             "move_z": "move_z(distance, velocity=0.04, acceleration=0.18); distance is millimeters in gripper/wrist-image +Z.",
@@ -1355,7 +2146,7 @@ async def run_defense_agent_real_once(
     planner_result = await planner.run(
         planner_task,
         max_steps=max_steps,
-        images=[current_global_image, current_wrist_image],
+        images=[current_global_image],
     )
     raw_planner_text = planner_result.final_answer
     plan = _extract_json_object(raw_planner_text)
@@ -1390,7 +2181,7 @@ async def run_defense_agent_real_once(
     supervisor_result = await supervisor.run(
         supervisor_task,
         max_steps=max_steps,
-        images=[current_global_image, current_wrist_image],
+        images=[current_global_image],
     )
     raw_supervisor_text = supervisor_result.final_answer
     atomic_task_info = _extract_json_object(raw_supervisor_text)
@@ -1424,8 +2215,16 @@ async def run_defense_agent_real_once(
     raw_coder_text = ""
     raw_judger_text = ""
     completed = True
+    phase_image_roles = {
+        "global_image": "Phase-local global camera image with YOLO boxes/labels for supervisor-named task objects.",
+        "wrist_image": (
+            "Phase-local wrist camera image from the gripper viewpoint with YOLO boxes/labels "
+            "for supervisor-named task objects; part of the gripper may appear along the bottom."
+        ),
+    }
 
     for atomic_index, atomic_info in enumerate(atomic_infos, start=1):
+        atomic_yolo_labels = _yolo_labels_from_atomic_info(atomic_info, fallback_task=task)
         phase_specs = _primitive_phase_specs(atomic_info)
         atomic_done = False
         phase_history: list[dict[str, Any]] = []
@@ -1442,7 +2241,10 @@ async def run_defense_agent_real_once(
         for phase_spec in phase_specs:
             feedback: dict[str, Any] | None = None
             phase_done = False
-            for attempt_index in range(1, max(1, int(max_attempts_per_atomic)) + 1):
+            last_phase_restore_report: dict[str, Any] | None = None
+            attempt_limit = None if max_attempts_per_atomic is None else max(1, int(max_attempts_per_atomic))
+            attempt_index = 1
+            while attempt_limit is None or attempt_index <= attempt_limit:
                 attempt_dir = (
                     log_dir
                     / f"atomic_{atomic_index:02d}"
@@ -1452,6 +2254,24 @@ async def run_defense_agent_real_once(
                 attempt_dir.mkdir(parents=True, exist_ok=True)
                 _save_json(attempt_dir / "atomic_task_info.json", atomic_info)
                 _save_json(attempt_dir / "current_phase.json", phase_spec.__dict__)
+                _save_json(attempt_dir / "yolo_detection_labels.json", {"labels": atomic_yolo_labels})
+
+                coder_global = attempt_dir / f"phase_{phase_spec.index:02d}_{phase_spec.slug}_before_coder_global_rgb.png"
+                coder_wrist = attempt_dir / f"phase_{phase_spec.index:02d}_{phase_spec.slug}_before_coder_wrist_rgb.png"
+                coder_scene_state = attempt_dir / f"phase_{phase_spec.index:02d}_{phase_spec.slug}_before_coder_scene_state.json"
+                coder_scene_payload = _capture_or_copy_observation(
+                    capture_observation_fn=capture_observation_fn,
+                    capture_images_fn=capture_images_fn,
+                    target_global=coder_global,
+                    target_wrist=coder_wrist,
+                    target_scene_state=coder_scene_state,
+                    yolo_target_labels=atomic_yolo_labels,
+                    resize_width=None,
+                )
+                latest_global = coder_global
+                latest_wrist = coder_wrist
+                latest_scene_state = coder_scene_state if coder_scene_state.exists() else latest_scene_state
+                latest_scene_state_payload = coder_scene_payload or latest_scene_state_payload
 
                 phase_context = {
                     "index": phase_spec.index,
@@ -1482,11 +2302,13 @@ async def run_defense_agent_real_once(
                     "Current phase JSON:\n"
                     f"{json.dumps(phase_context, ensure_ascii=False, indent=2)}\n\n"
                     "Current observation JSON:\n"
-                    f"{json.dumps({'global_image': str(latest_global), 'wrist_image': str(latest_wrist), 'global_rgb': str(latest_global), 'wrist_rgb': str(latest_wrist), 'scene_state': str(latest_scene_state) if latest_scene_state is not None else None, 'scene_state_brief': scene_state_brief(latest_scene_state_payload) if isinstance(latest_scene_state_payload, dict) else None, 'image_roles': observation['image_roles']}, ensure_ascii=False, indent=2)}\n\n"
+                    f"{json.dumps({'global_image': str(latest_global), 'wrist_image': str(latest_wrist), 'global_rgb': str(latest_global), 'wrist_rgb': str(latest_wrist), 'scene_state': str(latest_scene_state) if latest_scene_state is not None else None, 'scene_state_brief': scene_state_brief(latest_scene_state_payload) if isinstance(latest_scene_state_payload, dict) else None, 'yolo_detection_labels': atomic_yolo_labels, 'image_roles': phase_image_roles}, ensure_ascii=False, indent=2)}\n\n"
                     "Prior judger feedback JSON for this same phase, or null:\n"
                     f"{json.dumps(feedback, ensure_ascii=False, indent=2)}\n\n"
                     "Return exactly one fenced Python code block and nothing else."
                 )
+                _save_json(attempt_dir / "prior_judger_feedback.json", feedback or {})
+                _save_text(attempt_dir / "coder_prompt.txt", coder_task)
                 coder_result = await coder.run(
                     coder_task,
                     max_steps=max_steps,
@@ -1501,6 +2323,15 @@ async def run_defense_agent_real_once(
                 expected_phase: GeneratedPhaseBlock | None = None
                 try:
                     expected_phase = _validate_single_expected_phase(last_code, phase_spec)
+                    if (
+                        _primitive_name(atomic_info) in {"pick_place", "pick_and_place"}
+                        and phase_spec.slug
+                        in {"approach_object_above_and_open_gripper", "descend_to_source_prepare_to_grasp"}
+                        and "look_at_operated_object" not in last_code
+                    ):
+                        raise ValueError(
+                            "pick_place approach phases must call look_at_operated_object() for closed-loop gaze"
+                        )
                     runtime_report = _check_generated_code(last_code)
                     syntax_report = {
                         "ok": True,
@@ -1519,6 +2350,7 @@ async def run_defense_agent_real_once(
                 phase_wrist = attempt_dir / f"phase_{phase_spec.index:02d}_{phase_spec.slug}_wrist_rgb.png"
                 phase_scene_state = attempt_dir / f"phase_{phase_spec.index:02d}_{phase_spec.slug}_scene_state.json"
                 phase_scene_payload: dict[str, Any] | None = None
+                phase_start_robot_state: dict[str, Any] | None = None
                 if not bool(syntax_report.get("ok")):
                     last_execution = {"ok": False, "signal": "SYNTAX_PHASE_OR_RUNTIME_TOOL_CHECK_FAILED"}
                     phase_scene_payload = _capture_or_copy_observation(
@@ -1527,21 +2359,65 @@ async def run_defense_agent_real_once(
                         target_global=phase_global,
                         target_wrist=phase_wrist,
                         target_scene_state=phase_scene_state,
-                        resize_width=128,
+                        yolo_target_labels=atomic_yolo_labels,
+                        resize_width=None,
                     )
                 else:
-                    last_execution = _execute_real_code(
-                        code=last_code,
-                        controller=controller,
-                    )
+                    try:
+                        phase_start_robot_state = _snapshot_robot_initial_state(controller)
+                    except Exception:
+                        phase_start_robot_state = {
+                            "ok": False,
+                            "signal": "PHASE_START_ROBOT_STATE_SNAPSHOT_FAILED",
+                            "error": traceback.format_exc(),
+                        }
+                    _save_json(attempt_dir / "phase_start_robot_state.json", phase_start_robot_state)
+
+                    if phase_start_robot_state.get("signal") == "PHASE_START_ROBOT_STATE_SNAPSHOT_FAILED":
+                        last_execution = {
+                            "ok": False,
+                            "signal": "PHASE_START_ROBOT_STATE_SNAPSHOT_FAILED",
+                            "error": str(phase_start_robot_state.get("error", "")),
+                        }
+                    else:
+                        gaze_refine_counter = 0
+
+                        def gaze_refine_capture(refine_index: int) -> dict[str, Any] | None:
+                            nonlocal gaze_refine_counter
+                            if capture_observation_fn is None:
+                                return None
+                            gaze_refine_counter += 1
+                            refine_stem = (
+                                f"phase_{phase_spec.index:02d}_{phase_spec.slug}_"
+                                f"gaze_refine_{gaze_refine_counter:02d}"
+                            )
+                            return _capture_or_copy_observation(
+                                capture_observation_fn=capture_observation_fn,
+                                capture_images_fn=capture_images_fn,
+                                target_global=attempt_dir / f"{refine_stem}_global_rgb.png",
+                                target_wrist=attempt_dir / f"{refine_stem}_wrist_rgb.png",
+                                target_scene_state=attempt_dir / f"{refine_stem}_scene_state.json",
+                                yolo_target_labels=atomic_yolo_labels,
+                                resize_width=None,
+                            )
+
+                        last_execution = _execute_real_code(
+                            code=last_code,
+                            controller=controller,
+                            scene_state=coder_scene_payload,
+                            atomic_info=atomic_info,
+                            gaze_refine_fn=gaze_refine_capture,
+                        )
                     phase_scene_payload = _capture_or_copy_observation(
                         capture_observation_fn=capture_observation_fn,
                         capture_images_fn=capture_images_fn,
                         target_global=phase_global,
                         target_wrist=phase_wrist,
                         target_scene_state=phase_scene_state,
-                        resize_width=128,
+                        yolo_target_labels=atomic_yolo_labels,
+                        resize_width=None,
                     )
+                    phase_image_width_px = _image_width_px(phase_global)
                     last_execution["phases"] = [
                         {
                             "index": phase_spec.index,
@@ -1555,7 +2431,7 @@ async def run_defense_agent_real_once(
                             "wrist_rgb": str(phase_wrist),
                             "scene_state": str(phase_scene_state) if phase_scene_state.exists() else None,
                             "scene_state_brief": scene_state_brief(phase_scene_payload) if phase_scene_payload else None,
-                            "image_width_px": 128,
+                            "image_width_px": phase_image_width_px,
                             "error": last_execution.get("error"),
                         }
                     ]
@@ -1576,10 +2452,16 @@ async def run_defense_agent_real_once(
                     "scene_state": str(phase_scene_state) if phase_scene_state.exists() else None,
                     "scene_state_brief": scene_state_brief(phase_scene_payload) if phase_scene_payload else None,
                     "error": last_execution.get("error"),
-                    "image_width_px": 128,
+                    "image_width_px": _image_width_px(phase_global),
                     "is_final_phase": phase_spec.index == len(phase_specs),
-                    "image_roles": observation["image_roles"],
+                    "yolo_detection_labels": atomic_yolo_labels,
+                    "image_roles": phase_image_roles,
                     "completed_phase_history": _phase_history_for_prompt(phase_history),
+                    "phase_start_robot_state": (
+                        str(attempt_dir / "phase_start_robot_state.json")
+                        if phase_start_robot_state is not None
+                        else None
+                    ),
                 }
                 judge_prompt = (
                     "DEFENSE_EI_AGENTS_REAL_PHASE_JUDGING\n"
@@ -1594,7 +2476,8 @@ async def run_defense_agent_real_once(
                     "Real execution report:\n"
                     f"{json.dumps(last_execution, ensure_ascii=False, indent=2)}\n\n"
                     "Current phase manifest JSON. The two attached images are exactly this "
-                    "phase's global_image and wrist_image, in that order. global_image shows "
+                    "phase's global_image and wrist_image, in that order. These images include "
+                    "YOLO model box/label overlays when perception is enabled. global_image shows "
                     "the whole scene; wrist_image is from the gripper viewpoint and may show "
                     "part of the gripper at the bottom. If scene_state_brief is present, use "
                     "its approximate post-execution RGB-D distances as supporting evidence:\n"
@@ -1622,6 +2505,20 @@ async def run_defense_agent_real_once(
                             f"{str(phase_judge.get('analysis', '')).strip()}"
                         ).strip(),
                     }
+                phase_restore_report: dict[str, Any] | None = None
+                if not _is_success_judge(phase_judge):
+                    if isinstance(phase_start_robot_state, dict) and isinstance(
+                        phase_start_robot_state.get("joints"), list
+                    ):
+                        phase_restore_report = _restore_robot_initial_state(controller, phase_start_robot_state)
+                    else:
+                        phase_restore_report = {
+                            "ok": False,
+                            "signal": "REAL_RESTORE_PHASE_START_NO_SNAPSHOT",
+                        }
+                    last_phase_restore_report = phase_restore_report
+                    _save_json(attempt_dir / "restore_phase_start_robot_state.json", phase_restore_report)
+
                 phase_judge_with_context = {
                     "phase_index": phase_spec.index,
                     "phase_slug": phase_spec.slug,
@@ -1632,6 +2529,7 @@ async def run_defense_agent_real_once(
                     "scene_state": str(phase_scene_state) if phase_scene_state.exists() else None,
                     "scene_state_brief": scene_state_brief(phase_scene_payload) if phase_scene_payload else None,
                     "judge": phase_judge,
+                    "restore_phase_start_robot_state": phase_restore_report,
                 }
                 _save_json(attempt_dir / f"real_atomic_judge_phase_{phase_spec.index:02d}.json", phase_judge_with_context)
                 _save_text(attempt_dir / f"real_atomic_judge_phase_{phase_spec.index:02d}_raw.txt", raw_judger_text)
@@ -1653,6 +2551,16 @@ async def run_defense_agent_real_once(
                     "after_scene_state": str(phase_scene_state) if phase_scene_state.exists() else None,
                     "phase_images": [current_phase_manifest],
                     "phase_judgements": [phase_judge_with_context],
+                    "phase_start_robot_state": (
+                        str(attempt_dir / "phase_start_robot_state.json")
+                        if phase_start_robot_state is not None
+                        else None
+                    ),
+                    "restore_phase_start_robot_state": (
+                        str(attempt_dir / "restore_phase_start_robot_state.json")
+                        if phase_restore_report is not None
+                        else None
+                    ),
                     "code_path": str(attempt_dir / "real_phase_actions.py"),
                 }
                 attempts.append(attempt_record)
@@ -1672,12 +2580,16 @@ async def run_defense_agent_real_once(
                     "execution": last_execution,
                     "current_phase": phase_context,
                 }
+                attempt_index += 1
 
             if not phase_done:
                 completed = False
-                restore_report = _restore_robot_initial_state(controller, initial_robot_state)
                 failed_dir = log_dir / f"atomic_{atomic_index:02d}" / f"phase_{phase_spec.index:02d}_{phase_spec.slug}"
-                _save_json(failed_dir / "restore_initial_robot_state.json", restore_report)
+                if last_phase_restore_report is not None:
+                    _save_json(failed_dir / "restore_phase_start_robot_state.json", last_phase_restore_report)
+                else:
+                    restore_report = _restore_robot_initial_state(controller, initial_robot_state)
+                    _save_json(failed_dir / "restore_initial_robot_state.json", restore_report)
                 break
 
         atomic_done = all(
@@ -1723,8 +2635,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-attempts-per-atomic",
         type=int,
-        default=3,
-        help="Maximum retry attempts for each phase within an atomic task.",
+        default=None,
+        help="Maximum retry attempts for each phase within an atomic task. Defaults to unlimited.",
     )
 
     parser.add_argument("--robot-ip", default=ROBOT_IP)
@@ -1733,19 +2645,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--capture-only",
         action="store_true",
-        help="Only capture current global/wrist RGB images, then exit before agent generation or robot connection.",
+        help="Capture RGB-D perception artifacts, read current robot TCP pose, then exit before agent generation or robot motion.",
     )
     parser.add_argument("--list-cameras", action="store_true", help="List detected Intel RealSense cameras and exit.")
 
-    parser.add_argument("--camera-serials", default="", help="Comma-separated RealSense serials: global,wrist. Auto-discovers if omitted.")
+    parser.add_argument("--camera-serials", default="405622072940,420222071502", help="Comma-separated RealSense serials: global,wrist. Auto-discovers if omitted.")
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument("--camera-fps", type=int, default=30)
     parser.add_argument("--camera-warmup-frames", type=int, default=15)
     parser.add_argument(
+        "--camera-frame-timeout-ms",
+        type=int,
+        default=15000,
+        help="Milliseconds to wait for each RealSense RGB-D frame before retrying.",
+    )
+    parser.add_argument(
+        "--camera-capture-retries",
+        type=int,
+        default=3,
+        help="Number of RealSense frame wait attempts before failing a capture.",
+    )
+    parser.add_argument(
         "--global-camera-base-transform",
         type=Path,
-        default=None,
+        default="calibration/t_base_global_camera.json",
         help="JSON file containing a 4x4 transform matrix T_base_global_camera.",
     )
     parser.add_argument(
@@ -1757,23 +2681,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--wrist-camera-offset-y-m",
         type=float,
-        default=-0.02,
+        default=-0.04,
         help="Fallback wrist camera offset along gripper Y when no transform file is supplied.",
+    )
+    parser.add_argument(
+        "--wrist-camera-offset-z-m",
+        type=float,
+        default=-0.09,
+        help="Fallback wrist camera offset along gripper Z when no transform file is supplied.",
     )
     parser.add_argument(
         "--perception-backend",
         choices=["yolo", "color", "none"],
         default="yolo",
-        help="Object-estimation backend for scene_state. Use yolo for segmentation-model masks.",
+        help="Object-estimation backend for scene_state. Use yolo for model detections plus RGB-D depth.",
     )
     parser.add_argument(
         "--yolo-seg-model",
         type=Path,
         default=None,
-        help="Path/name of an Ultralytics YOLO segmentation model, e.g. models/best.pt or yolo11n-seg.pt.",
+        help=(
+            "Path/name of an Ultralytics YOLO model. If omitted with --perception-backend yolo, "
+            f"the script stores/uses {DEFAULT_YOLO_MODEL}."
+        ),
     )
     parser.add_argument("--yolo-conf", type=float, default=0.35, help="YOLO detection confidence threshold.")
     parser.add_argument("--yolo-iou", type=float, default=0.5, help="YOLO NMS IoU threshold.")
+    parser.add_argument(
+        "--yolo-device",
+        default="cpu",
+        help="Ultralytics inference device. Defaults to cpu to avoid mismatched torchvision CUDA NMS builds; use 0 or cuda:0 after fixing CUDA wheels.",
+    )
     parser.add_argument(
         "--yolo-target-labels",
         default="",
@@ -1794,10 +2732,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--current-wrist-image", type=Path, default=None, help="Use an existing wrist RGB image instead of capturing.")
 
-    parser.add_argument("--embedding-model", default=os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small"))
+    parser.add_argument("--embedding-model", default=os.environ.get("EMBEDDING_MODEL"))
     parser.add_argument("--embedding-api-key", default=os.environ.get("EMBEDDING_API_KEY"))
     parser.add_argument("--embedding-base-url", default=os.environ.get("EMBEDDING_BASE_URL"))
-    parser.add_argument("--embedding-dims", type=int, default=int(os.environ.get("EMBEDDING_DIMS", "1536")))
+    parser.add_argument(
+        "--embedding-dims",
+        type=int,
+        default=int(os.environ["EMBEDDING_DIMS"]) if os.environ.get("EMBEDDING_DIMS") else None,
+    )
     return parser.parse_args()
 
 
@@ -1816,8 +2758,6 @@ async def _main_async() -> int:
         return 0
     if not str(args.task).strip():
         raise ValueError("--task is required unless --list-cameras is used.")
-    if str(args.perception_backend).strip().lower() == "yolo" and not args.yolo_seg_model and not args.capture_only:
-        raise ValueError("--perception-backend yolo requires --yolo-seg-model for real execution.")
 
     run_dir = _resolve_path(args.log_root) / time.strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1830,7 +2770,10 @@ async def _main_async() -> int:
     t_gripper_wrist_camera = (
         load_transform(args.wrist_camera_gripper_transform)
         if args.wrist_camera_gripper_transform
-        else gripper_to_wrist_camera_transform(float(args.wrist_camera_offset_y_m))
+        else gripper_to_wrist_camera_transform(
+            float(args.wrist_camera_offset_y_m),
+            float(args.wrist_camera_offset_z_m),
+        )
     )
     yolo_target_labels = [
         label.strip()
@@ -1838,6 +2781,20 @@ async def _main_async() -> int:
         if label.strip()
     ]
     yolo_model_path = str(args.yolo_seg_model) if args.yolo_seg_model else None
+    perception_backend = str(args.perception_backend).strip().lower()
+    if perception_backend == "yolo":
+        if yolo_model_path:
+            raw_yolo_path = Path(yolo_model_path)
+            if not raw_yolo_path.is_absolute() and raw_yolo_path.parent == Path("."):
+                yolo_model_path = str(_ensure_yolo_checkpoint_in_default_dir(raw_yolo_path.name))
+                _log(f"Using named YOLO checkpoint from {yolo_model_path}.")
+        else:
+            yolo_model_path = str(_ensure_yolo_checkpoint_in_default_dir(DEFAULT_YOLO_MODEL_NAME))
+            _log(f"No --yolo-seg-model supplied; using default Ultralytics model at {yolo_model_path}.")
+    if perception_backend == "yolo":
+        _log(f"Checking required YOLO model: {yolo_model_path}")
+        _log(f"Using YOLO inference device: {str(args.yolo_device).strip() or 'cpu'}")
+        ensure_yolo_model_available(yolo_model_path)
 
     controller = UR7eVectorController(
         robot_ip=str(args.robot_ip),
@@ -1857,6 +2814,8 @@ async def _main_async() -> int:
         global_frame: RGBDFrame | None,
         wrist_frame: RGBDFrame | None,
         scene_path: Path,
+        perception_backend_override: str | None = None,
+        yolo_target_labels_override: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         tcp_pose = controller.get_current_tcp_pose()
         scene_state = build_scene_state(
@@ -1866,11 +2825,12 @@ async def _main_async() -> int:
             tcp_pose_base=tcp_pose,
             t_base_global_camera=t_base_global_camera,
             t_gripper_wrist_camera=t_gripper_wrist_camera,
-            perception_backend=str(args.perception_backend),
+            perception_backend=str(perception_backend_override or args.perception_backend),
             yolo_model_path=yolo_model_path,
             yolo_confidence=float(args.yolo_conf),
             yolo_iou=float(args.yolo_iou),
-            yolo_target_labels=yolo_target_labels,
+            yolo_target_labels=list(yolo_target_labels_override or yolo_target_labels),
+            yolo_device=str(args.yolo_device).strip() or "cpu",
         )
         _save_json(scene_path, scene_state)
         return scene_state
@@ -1881,6 +2841,45 @@ async def _main_async() -> int:
             raise FileNotFoundError(f"current image(s) not found: {source_global}, {source_wrist}")
         current_global = source_global
         current_wrist = source_wrist
+        if perception_backend == "yolo":
+            current_global = run_dir / "current_global_rgb.png"
+            current_wrist = run_dir / "current_wrist_rgb.png"
+            global_rgb = imageio.imread(source_global)
+            wrist_rgb = imageio.imread(source_wrist)
+            empty_depth_global = getattr(global_rgb, "shape", [0, 0])
+            empty_depth_wrist = getattr(wrist_rgb, "shape", [0, 0])
+            import numpy as np
+
+            global_frame_for_annotation = RGBDFrame(
+                color=global_rgb,
+                depth_m=np.zeros(empty_depth_global[:2], dtype=np.float32),
+                intrinsics={},
+                depth_scale=1.0,
+            )
+            wrist_frame_for_annotation = RGBDFrame(
+                color=wrist_rgb,
+                depth_m=np.zeros(empty_depth_wrist[:2], dtype=np.float32),
+                intrinsics={},
+                depth_scale=1.0,
+            )
+            global_annotated = annotate_yolo_image(
+                frame=global_frame_for_annotation,
+                model_path=yolo_model_path,
+                confidence=float(args.yolo_conf),
+                iou=float(args.yolo_iou),
+                target_labels=yolo_target_labels,
+                device=str(args.yolo_device).strip() or "cpu",
+            )
+            wrist_annotated = annotate_yolo_image(
+                frame=wrist_frame_for_annotation,
+                model_path=yolo_model_path,
+                confidence=float(args.yolo_conf),
+                iou=float(args.yolo_iou),
+                target_labels=yolo_target_labels,
+                device=str(args.yolo_device).strip() or "cpu",
+            )
+            imageio.imwrite(current_global, global_annotated)
+            imageio.imwrite(current_wrist, wrist_annotated)
 
         _log("Starting RealSense capture for post-execution feedback")
         with RealSenseRGBPair(
@@ -1889,6 +2888,8 @@ async def _main_async() -> int:
             height=int(args.camera_height),
             fps=int(args.camera_fps),
             warmup_frames=int(args.camera_warmup_frames),
+            frame_timeout_ms=int(args.camera_frame_timeout_ms),
+            capture_retries=int(args.camera_capture_retries),
         ) as cameras:
             try:
                 _log(f"Connecting UR7e controller at {args.robot_ip}")
@@ -1901,18 +2902,31 @@ async def _main_async() -> int:
                     imageio.imwrite(global_path, global_done)
                     imageio.imwrite(wrist_path, wrist_done)
 
-                def capture_observation(global_path: Path, wrist_path: Path, scene_path: Path) -> dict[str, Any]:
+                def capture_observation(
+                    global_path: Path,
+                    wrist_path: Path,
+                    scene_path: Path,
+                    *,
+                    yolo_target_labels: Sequence[str] | None = None,
+                ) -> dict[str, Any]:
                     global_frame, wrist_frame = cameras.capture_rgbd()
                     _write_rgbd_observation(
                         global_path=global_path,
                         wrist_path=wrist_path,
                         global_frame=global_frame,
                         wrist_frame=wrist_frame,
+                        perception_backend=str(args.perception_backend),
+                        yolo_model_path=yolo_model_path,
+                        yolo_confidence=float(args.yolo_conf),
+                        yolo_iou=float(args.yolo_iou),
+                        yolo_target_labels=list(yolo_target_labels or []),
+                        yolo_device=str(args.yolo_device).strip() or "cpu",
                     )
                     return make_scene_state(
                         global_frame=global_frame,
                         wrist_frame=wrist_frame,
                         scene_path=scene_path,
+                        yolo_target_labels_override=yolo_target_labels,
                     )
 
                 outputs = await run_defense_agent_real_once(
@@ -1927,11 +2941,11 @@ async def _main_async() -> int:
                     log_dir=run_dir,
                     controller=controller,
                     max_steps=args.max_steps,
-                    max_attempts_per_atomic=int(args.max_attempts_per_atomic),
-                    embedding_model=str(args.embedding_model),
+                    max_attempts_per_atomic=args.max_attempts_per_atomic,
+                    embedding_model=args.embedding_model,
                     embedding_api_key=args.embedding_api_key,
                     embedding_base_url=args.embedding_base_url,
-                    embedding_dims=int(args.embedding_dims),
+                    embedding_dims=args.embedding_dims,
                     capture_images_fn=capture_images,
                     capture_observation_fn=capture_observation,
                 )
@@ -1962,30 +2976,101 @@ async def _main_async() -> int:
         height=int(args.camera_height),
         fps=int(args.camera_fps),
         warmup_frames=int(args.camera_warmup_frames),
+        frame_timeout_ms=int(args.camera_frame_timeout_ms),
+        capture_retries=int(args.camera_capture_retries),
     ) as cameras:
         global_frame, wrist_frame = cameras.capture_rgbd()
-        rgbd_sidecars = _write_rgbd_observation(
-            global_path=current_global,
-            wrist_path=current_wrist,
-            global_frame=global_frame,
-            wrist_frame=wrist_frame,
-        )
 
         if args.capture_only:
+            capture_artifacts = _write_capture_only_observation(
+                run_dir=run_dir,
+                global_frame=global_frame,
+                wrist_frame=wrist_frame,
+                perception_backend=str(args.perception_backend),
+                yolo_model_path=yolo_model_path,
+                yolo_confidence=float(args.yolo_conf),
+                yolo_iou=float(args.yolo_iou),
+                yolo_target_labels=yolo_target_labels,
+                yolo_device=str(args.yolo_device).strip() or "cpu",
+            )
+            tcp_pose: list[float] | None = None
+            _log(f"Connecting UR7e controller at {args.robot_ip} to read TCP pose")
+            try:
+                controller.connect()
+                tcp_pose = controller.get_current_tcp_pose()
+            finally:
+                controller.close()
+            scene_state = build_scene_state(
+                task_text=str(args.task).strip(),
+                global_frame=global_frame,
+                wrist_frame=wrist_frame,
+                tcp_pose_base=tcp_pose,
+                t_base_global_camera=t_base_global_camera,
+                t_gripper_wrist_camera=t_gripper_wrist_camera,
+                perception_backend=str(args.perception_backend),
+                yolo_model_path=yolo_model_path,
+                yolo_confidence=float(args.yolo_conf),
+                yolo_iou=float(args.yolo_iou),
+                yolo_target_labels=yolo_target_labels,
+                yolo_device=str(args.yolo_device).strip() or "cpu",
+            )
+            _save_json(current_scene, scene_state)
+            object_positions = {
+                "schema": "defense_ei_capture_only_object_positions.v1",
+                "source_scene_state": str(current_scene),
+                "objects": [
+                    {
+                        "label": obj.get("label"),
+                        "status": obj.get("status"),
+                        "confidence": obj.get("confidence"),
+                        "bbox_px": obj.get("bbox_px"),
+                        "center_global_camera_m": obj.get("center_global_camera_m"),
+                        "center_base_m": obj.get("center_base_m"),
+                        "center_gripper_mm": obj.get("center_gripper_mm"),
+                        "grasp_region_center_global_camera_m": obj.get("grasp_region_center_global_camera_m"),
+                        "grasp_region_center_base_m": obj.get("grasp_region_center_base_m"),
+                        "grasp_region_center_gripper_mm": obj.get("grasp_region_center_gripper_mm"),
+                        "point_cloud": obj.get("point_cloud"),
+                    }
+                    for obj in scene_state.get("objects", [])
+                ],
+            }
+            object_positions_path = run_dir / "current_object_positions.json"
+            _save_json(object_positions_path, object_positions)
             summary = {
                 "run_dir": str(run_dir),
                 "capture_only": True,
-                "global_image": str(current_global),
-                "wrist_image": str(current_wrist),
+                "global_image": capture_artifacts["global_image"],
+                "wrist_image": capture_artifacts["wrist_image"],
+                "detection_images": capture_artifacts["detection_images"],
+                "current_scene_state": str(current_scene),
+                "object_positions": str(object_positions_path),
                 "global_shape": list(global_frame.color.shape),
                 "wrist_shape": list(wrist_frame.color.shape),
-                "rgbd_sidecars": rgbd_sidecars,
+                "rgbd_sidecars": capture_artifacts["rgbd_sidecars"],
+                "point_clouds": capture_artifacts["point_clouds"],
+                "scene_state_brief": scene_state_brief(scene_state),
+                "capture_only_robot_connected": True,
+                "tcp_pose_base": tcp_pose,
                 "global_exists": current_global.exists(),
                 "wrist_exists": current_wrist.exists(),
             }
             _save_json(run_dir / "summary.json", summary)
             print(json.dumps(summary, ensure_ascii=False, indent=2))
             return 0
+
+        rgbd_sidecars = _write_rgbd_observation(
+            global_path=current_global,
+            wrist_path=current_wrist,
+            global_frame=global_frame,
+            wrist_frame=wrist_frame,
+            perception_backend="none",
+            yolo_model_path=yolo_model_path,
+            yolo_confidence=float(args.yolo_conf),
+            yolo_iou=float(args.yolo_iou),
+            yolo_target_labels=yolo_target_labels,
+            yolo_device=str(args.yolo_device).strip() or "cpu",
+        )
 
         try:
             _log(f"Connecting UR7e controller at {args.robot_ip}")
@@ -1996,6 +3081,7 @@ async def _main_async() -> int:
                 global_frame=global_frame,
                 wrist_frame=wrist_frame,
                 scene_path=current_scene,
+                perception_backend_override="none",
             )
 
             def capture_images(global_path: Path, wrist_path: Path) -> None:
@@ -2003,18 +3089,31 @@ async def _main_async() -> int:
                 imageio.imwrite(global_path, global_done)
                 imageio.imwrite(wrist_path, wrist_done)
 
-            def capture_observation(global_path: Path, wrist_path: Path, scene_path: Path) -> dict[str, Any]:
+            def capture_observation(
+                global_path: Path,
+                wrist_path: Path,
+                scene_path: Path,
+                *,
+                yolo_target_labels: Sequence[str] | None = None,
+            ) -> dict[str, Any]:
                 global_done_frame, wrist_done_frame = cameras.capture_rgbd()
                 _write_rgbd_observation(
                     global_path=global_path,
                     wrist_path=wrist_path,
                     global_frame=global_done_frame,
                     wrist_frame=wrist_done_frame,
+                    perception_backend=str(args.perception_backend),
+                    yolo_model_path=yolo_model_path,
+                    yolo_confidence=float(args.yolo_conf),
+                    yolo_iou=float(args.yolo_iou),
+                    yolo_target_labels=list(yolo_target_labels or []),
+                    yolo_device=str(args.yolo_device).strip() or "cpu",
                 )
                 return make_scene_state(
                     global_frame=global_done_frame,
                     wrist_frame=wrist_done_frame,
                     scene_path=scene_path,
+                    yolo_target_labels_override=yolo_target_labels,
                 )
 
             outputs = await run_defense_agent_real_once(
@@ -2029,11 +3128,11 @@ async def _main_async() -> int:
                 log_dir=run_dir,
                 controller=controller,
                 max_steps=args.max_steps,
-                max_attempts_per_atomic=int(args.max_attempts_per_atomic),
-                embedding_model=str(args.embedding_model),
+                max_attempts_per_atomic=args.max_attempts_per_atomic,
+                embedding_model=args.embedding_model,
                 embedding_api_key=args.embedding_api_key,
                 embedding_base_url=args.embedding_base_url,
-                embedding_dims=int(args.embedding_dims),
+                embedding_dims=args.embedding_dims,
                 capture_images_fn=capture_images,
                 capture_observation_fn=capture_observation,
             )

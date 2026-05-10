@@ -51,8 +51,11 @@ python calibrate_global_camera.py \
 
 Replace `GLOBAL_SERIAL` with the serial number of the fixed global camera.
 
-If OpenCV is installed, the script opens each captured image and lets you click
-the calibration pixel. If not, or if GUI windows are inconvenient, use:
+If OpenCV with GUI support is installed, the script opens each captured image
+and lets you click the calibration pixel. If OpenCV is missing GUI support
+(for example `opencv-python-headless`) or GUI windows are inconvenient, the
+script falls back to typed pixel input automatically. You can also force typed
+input with:
 
 ```bash
 python calibrate_global_camera.py \

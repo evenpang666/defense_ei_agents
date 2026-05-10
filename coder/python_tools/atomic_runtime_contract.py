@@ -10,6 +10,7 @@ from typing import Any
 
 ALLOWED_RUNTIME_CALLS = {
     "gripper_control",
+    "look_at_operated_object",
     "move_x",
     "move_y",
     "move_z",
@@ -66,6 +67,7 @@ def runtime_api_catalog(environment: str = "real") -> dict[str, Any]:
             "gripper_control(value, delay)",
         ],
         "convenience": [
+            "look_at_operated_object(max_angle_rad=0.35, velocity=0.035, acceleration=0.14)",
             "move_x(distance, velocity=0.04, acceleration=0.18)",
             "move_y(distance, velocity=0.04, acceleration=0.18)",
             "move_z(distance, velocity=0.04, acceleration=0.18)",
@@ -76,12 +78,13 @@ def runtime_api_catalog(environment: str = "real") -> dict[str, Any]:
         ],
         "notes": [
             "UR7e real runtime; no simulation tools.",
-            "Generated code may call only move_x, move_y, move_z, rotate_x, rotate_y, rotate_z, sleep, and gripper_control.",
+            "Generated code may call only move_x, move_y, move_z, rotate_x, rotate_y, rotate_z, look_at_operated_object, sleep, and gripper_control.",
             "move_x/move_y/move_z distances are millimeters in the gripper/wrist-image frame.",
             "rotate_x/rotate_y/rotate_z angle increments are radians.",
             "Do not call move_ee, ee_pose, move_to, or print; they are not exposed to generated code.",
             "Wrist image right is gripper +X, wrist image down is gripper +Y, and wrist image forward is gripper +Z.",
             "Use object-safe slow motion: small deltas, low velocity/acceleration, and pauses near contact.",
+            "For pick_place phases, call look_at_operated_object near the end of each phase so wrist_image keeps the operated object in view.",
             "Gripper value is 0..255, where 0=open and 255=closed.",
             "Do not generate quaternion code or four-value rotation literals.",
             "Primitive names such as pick_place, push, pull, press, open, close, and pour are labels only; expand them into axis-wise motion, gripper_control, and sleep phases instead of calling them.",

@@ -42,6 +42,9 @@ def supervisor_output_schema() -> dict[str, Any]:
                 "operated_object": "str|null",
                 "source_object": "str|null",
                 "target_object": "str|null",
+                "task_related_objects": ["str"],
+                "grasp_point_reference": "str",
+                "target_point_reference": "str",
                 "target_state": "str",
                 "motion_type": "translation|rotation|hybrid",
                 "constraints": ["str"],
@@ -73,6 +76,10 @@ def validate_supervisor_json(payload_text: str) -> str:
         primitive = str(info.get("primitive_skill", "")).strip()
         if primitive not in PRIMITIVE_SKILLS:
             raise ValueError(f"unsupported primitive_skill: {primitive}")
+        if not str(info.get("grasp_point_reference", "")).strip():
+            raise ValueError("grasp_point_reference is required")
+        if not str(info.get("target_point_reference", "")).strip():
+            raise ValueError("target_point_reference is required")
         if not str(info.get("target_state", "")).strip():
             raise ValueError("target_state is required")
         if not str(info.get("done_criteria", "")).strip():

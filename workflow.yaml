@@ -16,8 +16,12 @@ workflow:
   runtime:
     robot: UR7e
     camera_inputs:
+      initial_agent_images:
+        global_image: logs/current_global_rgb.png
+      phase_agent_images:
+        global_image: logs/current_phase_global_rgb.png
+        wrist_image: logs/current_phase_wrist_rgb.png
       global_image: logs/current_global_rgb.png
-      wrist_image: logs/current_wrist_rgb.png
     retry_policy:
       restore_robot_to_initial_pose_on_failure: true
       continue_from_current_rgb_on_success: true

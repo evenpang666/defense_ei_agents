@@ -88,6 +88,7 @@ class RealSenseDepthCamera:
         self._pipeline: Any | None = None
         self._profile: Any | None = None
         self._align = rs.align(rs.stream.color)
+        self._depth_filters: list[Any] = []
 
     def __enter__(self) -> "RealSenseDepthCamera":
         if self._serial.upper() in PLACEHOLDER_SERIALS or self._serial.upper().endswith("_SERIAL"):
@@ -103,6 +104,8 @@ class RealSenseDepthCamera:
         cfg.enable_stream(self._rs.stream.depth, self._width, self._height, self._rs.format.z16, self._fps)
         self._pipeline = self._rs.pipeline()
         self._profile = self._pipeline.start(cfg)
+        self._configure_depth_sensor(self._profile.get_device().first_depth_sensor(), serial)
+        self._depth_filters = self._make_depth_filters()
         for _ in range(self._warmup_frames):
             self.capture()
         return self
@@ -115,12 +118,73 @@ class RealSenseDepthCamera:
                 pass
         self._pipeline = None
         self._profile = None
+        self._depth_filters = []
 
     def _discover_first_serial(self) -> str:
         devices = list(self._rs.context().query_devices())
         if not devices:
             return ""
         return devices[0].get_info(self._rs.camera_info.serial_number)
+
+    def _set_sensor_option(self, sensor: Any, option: Any, value: float, label: str, serial: str) -> None:
+        try:
+            if hasattr(sensor, "supports") and not sensor.supports(option):
+                return
+            sensor.set_option(option, float(value))
+        except Exception as exc:
+            _log(f"RealSense depth option '{label}' was not applied for serial '{serial}': {exc}")
+
+    def _set_filter_option(self, filter_obj: Any, option: Any, value: float) -> None:
+        try:
+            if hasattr(filter_obj, "supports") and not filter_obj.supports(option):
+                return
+            filter_obj.set_option(option, float(value))
+        except Exception:
+            pass
+
+    def _configure_depth_sensor(self, depth_sensor: Any, serial: str) -> None:
+        option = self._rs.option
+        self._set_sensor_option(depth_sensor, option.visual_preset, 4, "visual_preset=high_density", serial)
+        self._set_sensor_option(depth_sensor, option.emitter_enabled, 1, "emitter_enabled", serial)
+        self._set_sensor_option(depth_sensor, option.enable_auto_exposure, 1, "enable_auto_exposure", serial)
+        try:
+            laser_range = depth_sensor.get_option_range(option.laser_power)
+            self._set_sensor_option(depth_sensor, option.laser_power, laser_range.max, "laser_power=max", serial)
+        except Exception as exc:
+            _log(f"RealSense laser power was not adjusted for serial '{serial}': {exc}")
+
+    def _make_depth_filters(self) -> list[Any]:
+        filters: list[Any] = []
+        try:
+            depth_to_disparity = self._rs.disparity_transform(True)
+            spatial = self._rs.spatial_filter()
+            temporal = self._rs.temporal_filter()
+            disparity_to_depth = self._rs.disparity_transform(False)
+            hole_filling = self._rs.hole_filling_filter()
+
+            self._set_filter_option(spatial, self._rs.option.filter_magnitude, 2)
+            self._set_filter_option(spatial, self._rs.option.filter_smooth_alpha, 0.5)
+            self._set_filter_option(spatial, self._rs.option.filter_smooth_delta, 20)
+            self._set_filter_option(spatial, self._rs.option.holes_fill, 3)
+            self._set_filter_option(temporal, self._rs.option.filter_smooth_alpha, 0.4)
+            self._set_filter_option(temporal, self._rs.option.filter_smooth_delta, 20)
+            self._set_filter_option(temporal, self._rs.option.persistence_control, 3)
+            self._set_filter_option(hole_filling, self._rs.option.holes_fill, 1)
+
+            filters.extend([depth_to_disparity, spatial, temporal, disparity_to_depth, hole_filling])
+        except Exception as exc:
+            _log(f"RealSense depth post-processing filters were not created: {exc}")
+        return filters
+
+    def _process_depth_frame(self, depth: Any) -> Any:
+        processed = depth
+        for depth_filter in self._depth_filters:
+            try:
+                processed = depth_filter.process(processed)
+            except Exception as exc:
+                _log(f"RealSense depth filter failed: {exc}")
+                return depth
+        return processed
 
     def capture(self) -> tuple[np.ndarray, np.ndarray, dict[str, float], float]:
         if self._pipeline is None or self._profile is None:
@@ -130,6 +194,7 @@ class RealSenseDepthCamera:
         depth = frames.get_depth_frame()
         if not color or not depth:
             raise RuntimeError("Failed to capture aligned RGB-D frames.")
+        depth = self._process_depth_frame(depth)
 
         intr = color.profile.as_video_stream_profile().intrinsics
         depth_sensor = self._profile.get_device().first_depth_sensor()
@@ -202,20 +267,28 @@ def _maybe_click_pixel(image_path: Path) -> tuple[int, int] | None:
             selected.append((int(x), int(y)))
 
     window = "click calibration point; press Enter when selected, Esc to type manually"
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback(window, on_mouse)
-    while True:
-        shown = image.copy()
-        if selected:
-            cv2.drawMarker(shown, selected[0], (0, 255, 0), cv2.MARKER_CROSS, 24, 2)
-        cv2.imshow(window, shown)
-        key = cv2.waitKey(30) & 0xFF
-        if key in (13, 10) and selected:
+    try:
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(window, on_mouse)
+        while True:
+            shown = image.copy()
+            if selected:
+                cv2.drawMarker(shown, selected[0], (0, 255, 0), cv2.MARKER_CROSS, 24, 2)
+            cv2.imshow(window, shown)
+            key = cv2.waitKey(30) & 0xFF
+            if key in (13, 10) and selected:
+                cv2.destroyWindow(window)
+                return selected[0]
+            if key == 27:
+                cv2.destroyWindow(window)
+                return None
+    except Exception as exc:
+        _log(f"OpenCV click UI unavailable ({exc}); falling back to typed pixel input.")
+        try:
             cv2.destroyWindow(window)
-            return selected[0]
-        if key == 27:
-            cv2.destroyWindow(window)
-            return None
+        except Exception:
+            pass
+        return None
 
 
 def _solve_rigid_transform(
@@ -372,7 +445,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-dir", type=Path, default=Path("calibration/samples"))
     parser.add_argument("--num-points", type=int, default=8)
     parser.add_argument("--robot-ip", default=ROBOT_IP)
-    parser.add_argument("--camera-serial", default="", help="Global RealSense serial. If omitted, uses the first detected camera.")
+    parser.add_argument("--camera-serial", default="405622072940", help="Global RealSense serial. If omitted, uses the first detected camera.")
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument("--camera-fps", type=int, default=30)

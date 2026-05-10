@@ -1,9 +1,9 @@
 agent:
   llm:
     provider: openai
-    model: gpt-5.4
+    model: gpt-5.2
     base_url: https://api.qnaigc.com/v1
-    api_key: 
+    api_key: sk-ceface1d862d48be4d5c59e1a0b910e726e257c7d898bdb60f819bbdae639ce5
   id: "defense_ei_supervisor"
   name: "Defense EI Atomic Task Supervisor"
   traits: "robotics atomic-task information writer, strict JSON output"

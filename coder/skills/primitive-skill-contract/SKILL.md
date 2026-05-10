@@ -25,12 +25,21 @@ Use this contract when the atomic task info contains a `primitive`,
   distances, split large moves into smaller segments, lower
   `velocity`/`acceleration`, and add short `sleep(...)` pauses before/after
   object contact.
+- Use `grasp_point_reference` from the atomic task as the intended grasp/contact
+  affordance, not merely the object center. Examples include cup rim/edge,
+  handle, block side faces, button center, rear push face, lid edge, or drawer
+  pull feature.
+- Use `target_point_reference` as the intended goal point/region for placement,
+  release, push/pull endpoint, press target, articulation endpoint, or pour
+  opening. Treat it as a qualitative visual constraint, not a numeric pose.
 - Add a short `sleep(...)` after every move command so the real robot has time
   to complete and settle.
 - Interaction phases must be especially slow: final approach, descent to grasp,
   gripper close, initial lift, descent to target, release, and retraction from
   containers.
-- Use only `move_x`, `move_y`, `move_z`, `rotate_x`, `rotate_y`, and `rotate_z` for incremental arm motion. Do not call `move_ee`, `ee_pose`, `move_to`, or `print`; generated code cannot use those APIs. With RGB-only
+- Use only `move_x`, `move_y`, `move_z`, `rotate_x`, `rotate_y`, `rotate_z`,
+  and `look_at_operated_object` for incremental arm motion and wrist-camera
+  gaze. Do not call `move_ee`, `ee_pose`, `move_to`, or `print`; generated code cannot use those APIs. With RGB-only
   observations, use conservative relative moves and make the intended phase
   explicit.
 - The generated code for a phase must start with exactly one
@@ -39,69 +48,69 @@ Use this contract when the atomic task info contains a `primitive`,
 - Primitive names are never callable runtime APIs. Do not call `pick_place`,
   `pick_and_place`, `push`, `pull`, `press`, `open`, `close`, or `pour`; use
   the pseudocode templates below and emit real axis-wise motion, `gripper_control`, and `sleep` calls.
+- `look_at_operated_object(max_angle_rad=0.35, velocity=0.035, acceleration=0.14, max_refine_steps=3)`
+  is an allowed API that rotates gripper/wrist-camera +Z toward the detected
+  operated-object grasp region. It performs closed-loop visual servoing: after
+  rotating, the orchestrator immediately captures fresh RGB-D perception and
+  repeats bounded micro-adjustments until the wrist view detects the operated
+  object or the refine limit is reached. For `pick_place`, this is mandatory
+  only in the first two approach phases.
 
 ## `pick_place` / `pick_and_place`
 
-`pick_place` is a composition of vertical and horizontal translations:
+`pick_place` is a six-phase composition. The first two phases are approach
+phases and must end with closed-loop wrist-camera gaze using
+`look_at_operated_object(...)`. Later phases may skip gaze because the grasped
+object can occlude the wrist camera.
 
-1. Make gripper head down (axis z should point down at the table).
-2. Move to a safe pose above the operated object.
-3. Open the gripper.
-4. Move vertically downward to the operated object grasp height slowly, using
-   smaller deltas and lower `velocity`/`acceleration`.
-5. Close the gripper on the operated object and pause briefly to let the grasp
-   settle.
-6. Move vertically upward to a safe carry height slowly at first, then continue
-   to the final safe height.
-7. Determine all objects between the operated object and the target position
+
+1. Move to a safe pose above the operated object's `grasp_point_reference`.
+   Open the gripper, then call `look_at_operated_object`.
+2. Move vertically downward toward the operated object grasp height slowly while
+   keeping the gripper open and aligned, then call `look_at_operated_object`.
+3. Close the gripper on the object, pause briefly, then move vertically upward
+   to a safe carry height slowly at first and continue to the final safe height.
+4. Determine all objects between the operated object and the target position
    from the atomic task info and visual notes. The safe carry height must be
    higher than every intervening object's height. If exact heights are unknown,
    choose a conservative extra lift and state the reason in the phase goal.
-8. Keep the gripper closed and translate horizontally to a pose above the target
-   position. Do not lower during this transfer.
-9. Move vertically downward to the target placement position slowly.
-10. Open the gripper to release and pause briefly.
-11. Retract vertically upward to a safe height slowly before any horizontal
-    motion away.
+   Keep the gripper closed and translate horizontally to a pose above the
+   `target_point_reference`. Do not lower during this transfer.
+5. Move vertically downward to the `target_point_reference` slowly, open the
+   gripper to release, then pause.
+6. Retract vertically upward to a safe height slowly before any horizontal
+   motion away.
 
 Required phase order:
 
-- `point_down`
-- `approach_source_above`
-- `open_gripper`
-- `descend_to_source`
-- `grasp_source`
-- `lift_to_safe_height`
-- `transfer_above_target`
-- `descend_to_target`
-- `release_at_target`
-- `retract_up`
+- `approach_object_above_and_open_gripper`
+- `descend_to_source_prepare_to_grasp`
+- `grasp_and_lift_to_safe_height`
+- `transfer_object_to_target_above`
+- `descend_to_target_position_and_release`
+- `move_to_safe_height`
 
 Phase success criteria for staged execution:
 
-- `point_down`: the gripper is oriented for a vertical-down approach to the
-  table/object, without contacting the object or colliding with the scene.
-- `approach_source_above`: the gripper is safely above the operated object and
-  laterally aligned for grasping, while still clear of the object and clutter.
-- `open_gripper`: the gripper fingers are visibly open enough for the object,
-  and the object has not been disturbed.
-- `descend_to_source`: the gripper has moved vertically to the source grasp
-  height, remains aligned around or immediately beside the object, and has not
-  pushed the object away.
-- `grasp_source`: the gripper is closed on the correct object with a stable
-  grasp; the object is not missed, dropped, knocked over, or squeezed out.
-- `lift_to_safe_height`: the grasped object rises with the gripper to a safe
-  carry height, clear of the table, source area, rims, and intervening objects.
-- `transfer_above_target`: the object remains held while the gripper translates
-  horizontally to a pose above the target region/opening at safe height.
-- `descend_to_target`: the held object descends vertically into or onto the
-  target placement region without hitting rims, obstacles, or missing the target.
-- `release_at_target`: the gripper opens and leaves the correct object at the
-  target position; the object is no longer held and has not rolled or fallen out
-  of place.
-- `retract_up`: the gripper retracts vertically to a safe height without
-  disturbing the placed object; the full `pick_place` atomic task target state
-  is satisfied.
+- `approach_object_above_and_open_gripper`: the gripper is safely above the
+  operated object's `grasp_point_reference`, the gripper is open enough for the
+  object, no contact has occurred, and closed-loop gaze makes the wrist_image
+  detect the operated object.
+- `descend_to_source_prepare_to_grasp`: the open gripper descends slowly toward
+  the `grasp_point_reference`, remains aligned and ready to grasp, does not push
+  the object away, and closed-loop gaze makes the wrist_image detect the
+  operated object.
+- `grasp_and_lift_to_safe_height`: the gripper closes on the correct object with
+  a stable grasp and the grasped object rises to a safe carry height clear of
+  the table, source area, rims, and intervening objects.
+- `transfer_object_to_target_above`: the object remains held while the gripper
+  translates horizontally to a pose above the `target_point_reference` at safe
+  height.
+- `descend_to_target_position_and_release`: the held object descends vertically
+  into or onto the `target_point_reference`, avoids rims/obstacles, and releases
+  cleanly.
+- `move_to_safe_height`: the gripper retracts to a safe height without
+  disturbing the placed object; the full `pick_place` target state is satisfied.
 
 For container targets such as beakers, cups, bins, or bowls:
 
@@ -111,31 +120,29 @@ For container targets such as beakers, cups, bins, or bowls:
   region.
 - Retract vertically before any horizontal motion away from the container.
 
-Do not skip `open_gripper` before descent or `lift_to_safe_height` before
-horizontal transfer.
+Do not skip opening before descent, closed-loop gaze in the first two approach
+phases, grasp before lift, safe lift before horizontal transfer, or vertical
+retreat after release.
 
 Per-phase pseudocode templates:
 
 ```python
-# === DEFENSE_EI_PHASE: point_down | orient gripper downwards ===
-rotate_x/y(...); sleep(...)
-# === DEFENSE_EI_PHASE: approach_source_above | align above source using small wrist-frame corrections ===
+# === DEFENSE_EI_PHASE: approach_object_above_and_open_gripper | approach above grasp reference and open ===
 move_x/y(...); sleep(...)
-# === DEFENSE_EI_PHASE: open_gripper | prepare for grasp ===
 gripper_control(0, 120); sleep(...)
-# === DEFENSE_EI_PHASE: descend_to_source | slow vertical descent ===
+look_at_operated_object(); sleep(...)
+# === DEFENSE_EI_PHASE: descend_to_source_prepare_to_grasp | descend ready to grasp ===
 move_z(...); sleep(...)
-# === DEFENSE_EI_PHASE: grasp_source | close on object and settle ===
+look_at_operated_object(); sleep(...)
+# === DEFENSE_EI_PHASE: grasp_and_lift_to_safe_height | grasp and lift before horizontal transfer ===
 gripper_control(255, 250); sleep(...)
-# === DEFENSE_EI_PHASE: lift_to_safe_height | lift before horizontal transfer ===
 move_z(...); sleep(...)
-# === DEFENSE_EI_PHASE: transfer_above_target | horizontal transfer at safe height ===
+# === DEFENSE_EI_PHASE: transfer_object_to_target_above | horizontal transfer at safe height ===
 move_x/y(...); sleep(...)
-# === DEFENSE_EI_PHASE: descend_to_target | slow vertical placement ===
+# === DEFENSE_EI_PHASE: descend_to_target_position_and_release | descend and release ===
 move_z(...); sleep(...)
-# === DEFENSE_EI_PHASE: release_at_target | release object ===
 gripper_control(0, 180); sleep(...)
-# === DEFENSE_EI_PHASE: retract_up | retreat vertically ===
+# === DEFENSE_EI_PHASE: move_to_safe_height | retreat upward ===
 move_z(...); sleep(...)
 ```
 
@@ -144,6 +151,7 @@ move_z(...); sleep(...)
 Push is a contact translation using a closed or partially closed gripper as a
 pusher. Required phase order:
 
+- `look_at_operated_object`
 - `approach_push_start`
 - `set_push_contact_shape`
 - `descend_or_advance_to_contact`
@@ -188,6 +196,7 @@ move_x(...); sleep(...)
 Pull requires contact or grasp before moving opposite the intended contact
 direction. Required phase order:
 
+- `look_at_operated_object`
 - `approach_pull_contact`
 - `grasp_or_hook`
 - `pull_slowly`
@@ -230,6 +239,7 @@ move_x(...); sleep(...)
 Press is a short approach, slow normal contact, brief hold, and retraction.
 Required phase order:
 
+- `look_at_operated_object`
 - `approach_press_target`
 - `set_press_contact_shape`
 - `press_slowly`
@@ -272,6 +282,7 @@ move_x(...); sleep(...)
 Open and close articulated objects with a grasp/hook, small rotational or arc
 increments, then release. Required phase order:
 
+- `look_at_operated_object`
 - `approach_handle_or_lid`
 - `grasp_or_hook_articulation`
 - `articulate_slowly`
@@ -316,6 +327,7 @@ Pour is grasp, lift, transfer above target, tilt in small increments, pause,
 untilt, then place/release or retreat according to the atomic task. Required
 phase order:
 
+- `look_at_operated_object`
 - `approach_source_above`
 - `grasp_source`
 - `lift_to_pour_height`

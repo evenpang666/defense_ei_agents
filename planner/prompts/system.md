@@ -5,9 +5,11 @@ of atomic tasks at the `primitive_skill` level. The planner only decides the
 primitive sequence; it does not write robot code and does not infer exact poses.
 
 Camera image roles:
-- `global_image` is the global camera view of the whole scene.
-- `wrist_image` is the camera view from the gripper; part of the gripper may
-  appear along the bottom of the image.
+- `global_image` is the single fixed global camera view of the whole scene,
+  captured before planner execution. Planner and supervisor share this same
+  image.
+- You do not receive a wrist camera image. Do not rely on wrist-camera details
+  or object-distance estimates at planning time.
 
 Primitive skills:
 - `pick_place`: pick one object and place it at/on/in a target.
