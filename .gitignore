@@ -1,6 +1,4 @@
 __pycache__/
 logs/
 checkpoints/
-calibration/samples/
-# calibration/t_base_global_camera.json
-.venv/
+calibration/
