@@ -16,8 +16,8 @@ The orchestrator is `evaluate_defense_agent_real.py`. It executes real robot cod
 - Keep E-stop reachable.
 - Test camera capture and a tiny free-space motion before object interaction.
 - Generated code is statically checked before execution. It may call only:
-  `move_x`, `move_y`, `move_z`, `rotate_x`, `rotate_y`, `rotate_z`, `sleep`,
-  and `gripper_control`.
+  `move_x`, `move_y`, `move_z`, `rotate_x`, `rotate_y`, `rotate_z`,
+  `look_at_operated_object`, `sleep`, and `gripper_control`.
 - Primitive names such as `pick_place`, `push`, `pull`, `press`, `open`,
   `close`, and `pour` are labels only. The coder must expand them into
   axis-wise motion and `gripper_control` phases.
@@ -69,7 +69,7 @@ Install the project dependencies, DefenseAgent, RealSense bindings, and UR RTDE 
 
 ```bash
 pip install imageio pyyaml numpy openai ur-rtde pyrealsense2 ultralytics
-pip install DefenseAgent
+pip install defense-agent
 ```
 
 Installing DefenseAgent with `pip install -e ...` is important because the source tree also needs package dependencies such as `ms-agent` and `omegaconf`.
@@ -124,11 +124,24 @@ more forgiving capture setup:
 
 The workflow now saves depth sidecars and a structured `scene_state.json` for
 the initial observation and every post-phase capture. The scene state is passed
-to both coder and judger as approximate support for object/grasp-region
-distances relative to the current gripper. Object estimation uses YOLO masks or
-boxes plus RealSense depth.
+to both coder and judger as the perception handoff. Object estimation uses the
+global RealSense RGB image for YOLO boxes/masks and the aligned global depth map
+to reconstruct local 3D point clouds. By default, all YOLO-detected scene
+objects are included in `scene_state.json`.
 
-For calibrated base-frame coordinates, provide the fixed global-camera extrinsic:
+No global-camera calibration is required. Object coordinates are reported
+relative to the global camera, for example:
+
+- `objects[].center_global_camera_m`
+- `objects[].grasp_region_center_global_camera_m`
+- `objects[].point_cloud.bounds_camera_m`
+
+The current TCP pose is read from the robot and stored in the same JSON under
+`tcp.pose_base`. Optional base/gripper object fields are only populated when the
+corresponding transforms are available.
+
+If you also want optional base-frame object coordinates, provide the fixed
+global-camera extrinsic:
 
 ```bash
 python evaluate_defense_agent_real.py \
@@ -140,9 +153,7 @@ python evaluate_defense_agent_real.py \
 ```
 
 The transform file should contain either a top-level 4x4 JSON array or
-`{"matrix": [[...], [...], [...], [...]]}` for `T_base_global_camera`. If no
-global-camera transform is supplied, the run still saves RGB-D sidecars and
-camera-frame estimates, but base/gripper object coordinates are `null`.
+`{"matrix": [[...], [...], [...], [...]]}` for `T_base_global_camera`.
 
 The wrist camera defaults to an approximate gripper transform with offsets of
 `-0.04 m` along gripper Y and `-0.09 m` along gripper Z. Override it with:
@@ -160,7 +171,7 @@ for all YOLO checkpoints used by this workflow. Segmentation models such as
 clouds, but detection-only models are also supported by estimating depth from
 the detected box region. The selected pixels are converted into a local RGB-D
 point cloud. The workflow reports both the object center and a point-cloud grasp
-reference in `objects[].grasp_region_center_gripper_mm`.
+reference in `objects[].grasp_region_center_global_camera_m`.
 
 To limit scene_state to specific YOLO classes, pass comma-separated labels:
 
@@ -186,8 +197,8 @@ YOLO inference defaults to CPU because some Windows CUDA environments install a
 After installing matching CUDA builds of `torch` and `torchvision`, you can opt
 back into GPU inference with `--yolo-device 0` or `--yolo-device cuda:0`.
 
-To create `calibration/t_base_global_camera.json`, use
-`calibrate_global_camera.py`. See
+If you need optional base-frame object fields, create
+`calibration/t_base_global_camera.json` with `calibrate_global_camera.py`. See
 [`docs/global_camera_calibration.md`](docs/global_camera_calibration.md) for the
 full step-by-step procedure.
 
@@ -195,17 +206,16 @@ full step-by-step procedure.
 
 Use this to verify camera wiring and write a one-shot RGB-D perception snapshot
 without running planner/coder/judger or executing robot motion. The command
-connects to the robot by default to read the current TCP pose, so object
-positions include gripper-relative fields such as
-`grasp_region_center_gripper_mm`.
+connects to the robot by default to read the current TCP pose, so the compact
+object-position JSON contains both `tcp.pose_base` and all detected object
+positions in the global camera frame.
 
 ```bash
 python evaluate_defense_agent_real.py \
   --task "capture test" \
   --capture-only \
   --camera-serials GLOBAL_SERIAL,WRIST_SERIAL \
-  --yolo-seg-model checkpoints/robot_yolo26n_seg.pt \
-  --yolo-target-labels cube,bowl
+  --yolo-seg-model checkpoints/robot_yolo26n_seg.pt
 ```
 
 The command writes these files under `logs/defense_agent_real/<timestamp>/`:
@@ -219,6 +229,42 @@ The command writes these files under `logs/defense_agent_real/<timestamp>/`:
 - `*_point_cloud_front.png`, `*_point_cloud_top.png`: point-cloud visualizations.
 - `summary.json`: paths to the generated artifacts and the TCP pose used for
   gripper-relative coordinates.
+
+## Record Keypoints
+
+Use `record_keypoints.py` to continuously save named TCP poses with the current
+wrist RGB image. Each entered name appends one record to `keypoint_database.json`
+and saves the image under `record_image/`:
+
+```bash
+python record_keypoints.py \
+  --robot-ip 169.254.26.10 \
+  --camera-serials GLOBAL_SERIAL,WRIST_SERIAL
+```
+
+For a one-shot record:
+
+```bash
+python record_keypoints.py \
+  --robot-ip 169.254.26.10 \
+  --camera-serials GLOBAL_SERIAL,WRIST_SERIAL \
+  --name tube_1_grasp_point
+```
+
+During the full workflow, `evaluate_defense_agent_real.py` loads
+`keypoint_database.json` by default and passes the matching records to coder
+before each phase. The database is reference context only: coder should use the
+matched TCP pose and wrist image to understand where the grasp/place point is,
+then approach through `move_x`/`move_y`/`move_z` and `rotate_*` commands with
+distances appropriate to the remaining offset. Generated code must not call
+`move_to_keypoint` or any direct
+absolute-pose movement API.
+
+Use a custom database path with:
+
+```bash
+--keypoint-database path/to/keypoint_database.json
+```
 
 ## Run The Full Workflow
 
@@ -276,8 +322,9 @@ Each run creates a timestamped directory under `logs/defense_agent_real/` contai
   report for that phase
 - `atomic_XX/phase_NN_<slug>/attempt_YY/phase_start_robot_state.json`: joint,
   TCP, and gripper snapshot saved immediately before executing that phase
-- `atomic_XX/phase_NN_<slug>/attempt_YY/restore_phase_start_robot_state.json`:
-  restore report written when the judger marks the phase attempt as `FAIL`
+- `atomic_XX/phase_NN_<slug>/attempt_YY/restore_disabled_after_judge_fail.json`:
+  record written when the judger marks the phase attempt as `FAIL`; the robot
+  is left at its post-attempt pose and is not automatically restored
 - `atomic_XX/phase_NN_<slug>/attempt_YY/phase_NN_<slug>_gaze_refine_XX_*`:
   closed-loop wrist-gaze captures created by `look_at_operated_object()` during
   mandatory pick/place approach phases

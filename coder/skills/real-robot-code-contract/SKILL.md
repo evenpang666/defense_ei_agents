@@ -20,7 +20,7 @@ Allowed runtime APIs:
 - `rotate_z(angle_rad, velocity=0.04, acceleration=0.18)`
 - `look_at_operated_object(max_angle_rad=0.35, velocity=0.035, acceleration=0.14, max_refine_steps=3)`
   - rotate wrist-camera/gripper +Z toward the detected operated-object grasp
-    region, immediately capture fresh RGB-D perception, and repeat small gaze
+    region, immediately capture fresh RGB-D perception, and repeat bounded gaze
     corrections until the wrist camera detects the operated object or the
     bounded refine limit is reached.
 - `sleep(seconds)`
@@ -36,33 +36,44 @@ Generation rules:
   5 cm.
 - Use radians for every `rotate_x`/`rotate_y`/`rotate_z` rotation increment. Examples: `0.1745` is
   about 10 degrees and `1.5708` is about 90 degrees.
-- Use only the allowed axis-wise movement and rotation APIs for incremental arm
-  motion plus `look_at_operated_object` for gaze. Do not call `move_ee`,
-  `ee_pose`, `move_to`, or `print`; they are not available in generated-code
-  runtime API.
+- Use only the allowed axis-wise movement and rotation APIs for arm motion plus
+  `look_at_operated_object` for gaze. Do not call `move_to_keypoint`,
+  `move_ee`, `ee_pose`, `move_to`, or `print`; they are not available in
+  generated-code runtime API.
 - If the atomic task names a primitive skill, follow `primitive-skill-contract`
   for the required phase order, but emit only the current requested phase.
 - Primitive skill names are labels, not runtime APIs. Do not call
   `pick_place`, `pick_and_place`, `push`, `pull`, `press`, `open`, `close`, or
   `pour`; expand the current requested phase into low-level motion commands.
 - Do not invent exact object coordinates from RGB images alone.
-- Use small relative motions, slow contact, and explicit gripper commands.
+- If `keypoint_database.records` contains a named pose that clearly matches the
+  current grasp/place phase, use it only as reference context for where the
+  grasp/place point is. Approach through `move_x`/`move_y`/`move_z` and
+  `rotate_*` commands with travel distances that match the remaining offset; do
+  not call a direct keypoint movement API.
+- Use relative motions, controlled contact, and explicit gripper commands.
 - If `scene_state_brief` is present, it may include approximate
   `center_gripper_mm` and `grasp_region_center_gripper_mm` values from RGB-D
-  perception. Use these only as direction and distance hints for bounded
-  gripper-frame corrections. Split large offsets into small cautious moves and
-  do not drive directly into contact based on depth alone.
+  perception. Use these as direction and approximate distance hints for
+  gripper-frame corrections. Do not artificially shrink moves to tiny deltas
+  when the reference pose or scene evidence implies a larger offset, and do not
+  drive directly into contact based on depth alone.
+- If neither `scene_state_brief.objects` nor `scene_state_brief.wrist_objects`
+  contains the operated object, or the matching entry is `not_detected`, do not
+  call `look_at_operated_object(...)`. Use keypoint references, visible context,
+  prior feedback, and axis-wise moves instead.
 - For `pick_place`, call `look_at_operated_object(...)` near the end of the
   first two approach phases only:
   `approach_object_above_and_open_gripper` and
-  `descend_to_source_prepare_to_grasp`. Later phases may skip gaze because the
-  grasped object can occlude the wrist camera.
-- Overall motion must be slow enough to protect real objects. Prefer many small
-  axis-wise increments and low `velocity`/`acceleration` over a single large move.
+  `descend_to_source_prepare_to_grasp`, and only when the operated object is
+  present in scene_state/scene_state_brief. Later phases may skip gaze because
+  the grasped object can occlude the wrist camera.
+- Overall motion must be controlled enough to protect real objects. Long
+  free-space alignment moves may use appropriately sized axis-wise distances.
 - Near-object interaction phases must be slower than transit phases: approach,
   descend, grasp, push/pull/press contact, placement, release, and retraction
-  from a container should use smaller deltas, lower `velocity`/`acceleration`,
-  and brief `sleep(...)` pauses.
+  from a container should slow down near contact and use brief `sleep(...)`
+  pauses.
 - Add a short `sleep(...)` after every move command so each hardware motion has
   time to finish and settle before the next command.
 - If the atomic task info includes a concrete 6D TCP pose vector, treat it only

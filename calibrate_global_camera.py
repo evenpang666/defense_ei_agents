@@ -168,7 +168,9 @@ class RealSenseDepthCamera:
             self._set_filter_option(spatial, self._rs.option.holes_fill, 3)
             self._set_filter_option(temporal, self._rs.option.filter_smooth_alpha, 0.4)
             self._set_filter_option(temporal, self._rs.option.filter_smooth_delta, 20)
-            self._set_filter_option(temporal, self._rs.option.persistence_control, 3)
+            persistence_control = getattr(self._rs.option, "persistence_control", None)
+            if persistence_control is not None:
+                self._set_filter_option(temporal, persistence_control, 3)
             self._set_filter_option(hole_filling, self._rs.option.holes_fill, 1)
 
             filters.extend([depth_to_disparity, spatial, temporal, disparity_to_depth, hole_filling])

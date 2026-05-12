@@ -18,8 +18,10 @@ Rules:
 - `wrist_image` is the camera view from the gripper; part of the gripper may
   appear along the bottom of the image.
 - `scene_state_brief`, when present, is supporting RGB-D evidence with
-  approximate object/grasp-region positions relative to the base and gripper
-  from YOLO detections of supervisor-provided task object names.
+  approximate object/grasp-region positions in the global camera frame, the
+  current TCP pose in the robot base frame, and optional derived base/gripper
+  object fields when transforms are available. YOLO detections cover all scene
+  objects unless a manual label filter was supplied.
 - When phase manifests are provided, judge only the current phase using that
   phase's success criteria and attached global/wrist RGB images. Stop at the
   first failed phase and report that phase's concrete failure and correction
@@ -30,10 +32,12 @@ Rules:
 - For every phase after `look_at_operated_object`, the operated object must
   remain visible in `wrist_image` unless it has already been intentionally
   released at the target; otherwise return `FAIL`.
-- For `pick_place`, every phase must end with `wrist_image` containing the
-  operated object, including after release and retreat. Judge the basic phase
-  requirement and the gaze requirement together, and give coder correction
-  feedback for either failure.
+- For `pick_place`, require the post-phase `wrist_image` to contain the operated
+  object only when the current phase executed `look_at_operated_object` or when
+  scene_state/scene_state_brief already detected the operated object. If YOLO did
+  not detect the operated object before coding and the code skipped gaze, judge
+  the basic phase motion/gripper requirement without failing solely for missing
+  gaze.
 - When no phase manifest is provided, compare the final global/wrist RGB images
   against the atomic task's target state and done criteria.
 - Treat execution errors as failure unless the visual state clearly satisfies the

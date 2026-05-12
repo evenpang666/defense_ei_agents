@@ -48,10 +48,11 @@ still contain the operated object unless that phase has already intentionally
 released the object at the target. If the operated object is absent or fully
 occluded in the wrist view before release, return `FAIL` and explain that the
 next code should reacquire the object in the wrist camera.
-For `pick_place`, every phase must satisfy this gaze requirement: the
-post-phase wrist_image must contain the operated object, including after release
-and safe-height retraction. Judge both the phase's basic motion/gripper goal and
-whether the final wrist view is still watching the operated object.
+For `pick_place`, require the post-phase wrist_image to contain the operated
+object only when the current phase executed `look_at_operated_object` or when
+scene_state/scene_state_brief already detected the operated object. If YOLO did
+not detect the operated object before coding and the code skipped gaze, judge
+the phase's basic motion/gripper goal without failing solely for missing gaze.
 
 Output one JSON object only:
 `{"task_result": "SUCCESS" | "FAIL", "analysis": "..."}`

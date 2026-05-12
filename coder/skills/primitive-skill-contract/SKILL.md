@@ -21,10 +21,9 @@ Use this contract when the atomic task info contains a `primitive`,
 - Prefer vertical and horizontal Cartesian translations for pick/place style
   manipulation. Avoid diagonal shortcuts near objects, containers, rims, or
   clutter.
-- All primitive skills must be object-safe and slow. Use conservative travel
-  distances, split large moves into smaller segments, lower
-  `velocity`/`acceleration`, and add short `sleep(...)` pauses before/after
-  object contact.
+- All primitive skills must be object-safe. Use travel distances that match the
+  phase goal and available reference pose; slow down near object contact and add
+  short `sleep(...)` pauses before/after contact.
 - Use `grasp_point_reference` from the atomic task as the intended grasp/contact
   affordance, not merely the object center. Examples include cup rim/edge,
   handle, block side faces, button center, rear push face, lid edge, or drawer
@@ -34,14 +33,13 @@ Use this contract when the atomic task info contains a `primitive`,
   opening. Treat it as a qualitative visual constraint, not a numeric pose.
 - Add a short `sleep(...)` after every move command so the real robot has time
   to complete and settle.
-- Interaction phases must be especially slow: final approach, descent to grasp,
-  gripper close, initial lift, descent to target, release, and retraction from
-  containers.
+- Interaction phases should slow down near contact: final approach, descent to
+  grasp, gripper close, initial lift, descent to target, release, and retraction
+  from containers.
 - Use only `move_x`, `move_y`, `move_z`, `rotate_x`, `rotate_y`, `rotate_z`,
   and `look_at_operated_object` for incremental arm motion and wrist-camera
   gaze. Do not call `move_ee`, `ee_pose`, `move_to`, or `print`; generated code cannot use those APIs. With RGB-only
-  observations, use conservative relative moves and make the intended phase
-  explicit.
+  observations, use relative moves and make the intended phase explicit.
 - The generated code for a phase must start with exactly one
   `# === DEFENSE_EI_PHASE: <slug> | <short goal> ===`.
 - Keep the gripper state explicit before and after contact.
@@ -52,7 +50,7 @@ Use this contract when the atomic task info contains a `primitive`,
   is an allowed API that rotates gripper/wrist-camera +Z toward the detected
   operated-object grasp region. It performs closed-loop visual servoing: after
   rotating, the orchestrator immediately captures fresh RGB-D perception and
-  repeats bounded micro-adjustments until the wrist view detects the operated
+  repeats bounded gaze adjustments until the wrist view detects the operated
   object or the refine limit is reached. For `pick_place`, this is mandatory
   only in the first two approach phases.
 
@@ -73,7 +71,7 @@ object can occlude the wrist camera.
 4. Determine all objects between the operated object and the target position
    from the atomic task info and visual notes. The safe carry height must be
    higher than every intervening object's height. If exact heights are unknown,
-   choose a conservative extra lift and state the reason in the phase goal.
+   choose an adequate extra lift and state the reason in the phase goal.
    Keep the gripper closed and translate horizontally to a pose above the
    `target_point_reference`. Do not lower during this transfer.
 5. Move vertically downward to the `target_point_reference` slowly, open the
@@ -184,7 +182,7 @@ move_x(...); sleep(...)
 gripper_control(180, 120); sleep(...)
 # === DEFENSE_EI_PHASE: descend_or_advance_to_contact | slow contact approach ===
 move_x(...); sleep(...)
-# === DEFENSE_EI_PHASE: push_slowly | translate object in small increments ===
+# === DEFENSE_EI_PHASE: push_slowly | translate object in controlled motion ===
 move_x(...); sleep(...)
 move_x(...); sleep(...)
 # === DEFENSE_EI_PHASE: retract_from_contact | back away from object ===
@@ -225,7 +223,7 @@ Per-phase pseudocode templates:
 move_x(...); sleep(...)
 # === DEFENSE_EI_PHASE: grasp_or_hook | secure contact before pulling ===
 gripper_control(255, 220); sleep(...)
-# === DEFENSE_EI_PHASE: pull_slowly | pull with short conservative increments ===
+# === DEFENSE_EI_PHASE: pull_slowly | pull with controlled motion ===
 move_x(...); sleep(...)
 move_x(...); sleep(...)
 # === DEFENSE_EI_PHASE: release_if_grasped | let go after pull ===
@@ -269,7 +267,7 @@ Per-phase pseudocode templates:
 move_x(...); sleep(...)
 # === DEFENSE_EI_PHASE: set_press_contact_shape | close gripper for stable contact ===
 gripper_control(255, 120); sleep(...)
-# === DEFENSE_EI_PHASE: press_slowly | press along observed normal in small increments ===
+# === DEFENSE_EI_PHASE: press_slowly | press along observed normal ===
 move_x(...); sleep(...)
 # === DEFENSE_EI_PHASE: hold_press | keep contact briefly ===
 sleep(...)
@@ -279,8 +277,8 @@ move_x(...); sleep(...)
 
 ## `open` / `close`
 
-Open and close articulated objects with a grasp/hook, small rotational or arc
-increments, then release. Required phase order:
+Open and close articulated objects with a grasp/hook, controlled rotational or
+arc motion, then release. Required phase order:
 
 - `look_at_operated_object`
 - `approach_handle_or_lid`
@@ -312,7 +310,7 @@ Per-phase pseudocode templates:
 move_x(...); sleep(...)
 # === DEFENSE_EI_PHASE: grasp_or_hook_articulation | secure the feature ===
 gripper_control(255, 220); sleep(...)
-# === DEFENSE_EI_PHASE: articulate_slowly | move through small arc increments ===
+# === DEFENSE_EI_PHASE: articulate_slowly | move through controlled arc ===
 move_x(...); sleep(...)
 move_x(...); sleep(...)
 # === DEFENSE_EI_PHASE: release_articulation | release after target state is reached ===
@@ -323,7 +321,7 @@ move_x(...); sleep(...)
 
 ## `pour`
 
-Pour is grasp, lift, transfer above target, tilt in small increments, pause,
+Pour is grasp, lift, transfer above target, controlled tilt, pause,
 untilt, then place/release or retreat according to the atomic task. Required
 phase order:
 

@@ -26,13 +26,15 @@ Hard rules:
   pass `steps`; use the optional `velocity`/`acceleration` parameters for
   hardware speed control.
 - Use only `move_x`, `move_y`, `move_z`, `rotate_x`, `rotate_y`, `rotate_z`,
-  `sleep`, and `gripper_control`. Do not call `move_ee`, `ee_pose`, `move_to`,
-  or `print`; they are not available in the generated-code runtime API.
+  `look_at_operated_object`, `sleep`, and `gripper_control`. Treat
+  `keypoint_database.records` as reference context only; do not call
+  `move_to_keypoint`, `move_ee`, `ee_pose`, `move_to`, or `print`; they are not
+  available in the generated-code runtime API.
 - Add exactly one `# === DEFENSE_EI_PHASE: <slug> | <short goal> ===` marker
   before the current robotic stage. The slug must match the requested phase.
-- Keep actions conservative, slow, and explicit. Near-object interaction phases
-  must use smaller relative deltas, low `velocity`/`acceleration`, and short
-  pauses. Add a short `sleep(...)` after every move command.
+- Keep actions object-safe and explicit. Use travel distances appropriate to the
+  remaining offset. Slow down near object contact, and add a short `sleep(...)`
+  after every move command.
 
 Mandatory checks before final answer:
 1. Call `runtime_api_catalog("real")`.

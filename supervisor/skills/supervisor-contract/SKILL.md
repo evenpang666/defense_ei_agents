@@ -38,8 +38,9 @@ Rules:
 - One `atomic_task_info` entry per planner atomic task.
 - Use camera-observable `target_state` and `done_criteria`.
 - Provide specific object names in `operated_object`, `target_object`, and
-  `task_related_objects`; coder and judger use these strings as YOLO detection
-  labels and receive gripper-relative distance estimates from those detections.
+  `task_related_objects`; coder and judger use these strings to identify the
+  relevant entries in a scene-state JSON that contains all YOLO-detected
+  objects from the global camera.
 - Always provide `grasp_point_reference` and `target_point_reference` as
   qualitative visual constraints for the coder. Examples: "grasp the cup by its
   upper rim/edge", "pinch the block near its top side faces", "push on the rear

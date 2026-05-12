@@ -105,6 +105,7 @@ FORBIDDEN_RUNTIME_CALLS = {
     "open",
     "close",
     "pour",
+    "move_to_keypoint",
     "move_to",
     "move_ee",
     "ee_pose",
@@ -200,6 +201,117 @@ def _yolo_labels_from_atomic_info(atomic_info: dict[str, Any], *, fallback_task:
     if not labels:
         labels.append("object")
     return labels
+
+
+def _load_keypoint_database(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {
+            "schema": "defense_ei_keypoint_database.v1",
+            "source": None,
+            "available": False,
+            "records": [],
+        }
+    if not path.exists():
+        return {
+            "schema": "defense_ei_keypoint_database.v1",
+            "source": str(path),
+            "available": False,
+            "records": [],
+        }
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        records = payload
+        schema = "defense_ei_keypoint_database.v1"
+    elif isinstance(payload, dict):
+        records = payload.get("records", [])
+        schema = str(payload.get("schema", "defense_ei_keypoint_database.v1"))
+    else:
+        raise ValueError(f"Unsupported keypoint database format: {path}")
+    if not isinstance(records, list):
+        raise ValueError(f"Keypoint database records must be a list: {path}")
+    clean_records: list[dict[str, Any]] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        tcp_pose = item.get("tcp_pose")
+        if not name or not isinstance(tcp_pose, list) or len(tcp_pose) != 6:
+            continue
+        try:
+            pose = [float(v) for v in tcp_pose]
+        except (TypeError, ValueError):
+            continue
+        clean_records.append(
+            {
+                "name": name,
+                "tcp_pose": [round(v, 6) for v in pose],
+                "wrist_img_id": item.get("wrist_img_id"),
+                "wrist_img_path": item.get("wrist_img_path"),
+                "created_at": item.get("created_at"),
+            }
+        )
+    return {
+        "schema": schema,
+        "source": str(path),
+        "available": True,
+        "records": clean_records,
+    }
+
+
+def _keypoint_database_for_prompt(
+    database: dict[str, Any],
+    atomic_info: dict[str, Any],
+    *,
+    task: str,
+    max_records: int = 24,
+) -> dict[str, Any]:
+    records = database.get("records") if isinstance(database, dict) else []
+    if not isinstance(records, list):
+        records = []
+    query_parts: list[str] = [task]
+    for key in (
+        "description",
+        "primitive_skill",
+        "operated_object",
+        "source_object",
+        "target_object",
+        "task_related_objects",
+        "grasp_point_reference",
+        "target_point_reference",
+    ):
+        value = atomic_info.get(key)
+        if isinstance(value, list):
+            query_parts.extend(str(v) for v in value)
+        else:
+            query_parts.append(str(value or ""))
+    query_text = " ".join(query_parts).lower()
+    query_tokens = {
+        token
+        for token in re.split(r"[^a-zA-Z0-9_]+", query_text)
+        if len(token) >= 2 and token not in {"the", "and", "for", "with", "null", "none"}
+    }
+
+    def score(record: dict[str, Any]) -> tuple[int, str]:
+        name = str(record.get("name", "")).lower()
+        name_tokens = set(re.split(r"[^a-zA-Z0-9_]+", name))
+        value = len(query_tokens & name_tokens)
+        if "grasp" in name and "grasp" in query_text:
+            value += 4
+        if "place" in name and ("place" in query_text or "target" in query_text):
+            value += 3
+        if any(token and token in name for token in query_tokens):
+            value += 1
+        return value, name
+
+    ranked = sorted((r for r in records if isinstance(r, dict)), key=score, reverse=True)
+    selected = ranked[:max_records]
+    return {
+        "schema": database.get("schema", "defense_ei_keypoint_database.v1"),
+        "source": database.get("source"),
+        "available": bool(database.get("available")) and bool(records),
+        "selection_policy": "Ranked by overlap between atomic task/object/reference text and keypoint names.",
+        "records": selected,
+    }
 
 
 def _ensure_yolo_checkpoint_in_default_dir(model_name: str) -> Path:
@@ -436,7 +548,9 @@ class RealSenseRGBPair:
             self._set_filter_option(spatial, rs.option.holes_fill, 3)
             self._set_filter_option(temporal, rs.option.filter_smooth_alpha, 0.4)
             self._set_filter_option(temporal, rs.option.filter_smooth_delta, 20)
-            self._set_filter_option(temporal, rs.option.persistence_control, 3)
+            persistence_control = getattr(rs.option, "persistence_control", None)
+            if persistence_control is not None:
+                self._set_filter_option(temporal, persistence_control, 3)
             self._set_filter_option(hole_filling, rs.option.holes_fill, 1)
 
             filters.extend([depth_to_disparity, spatial, temporal, disparity_to_depth, hole_filling])
@@ -1124,7 +1238,7 @@ def _check_generated_code(code: str) -> dict[str, Any]:
             "xyzw",
             "ee_pose",
             "move_ee",
-            "move_to",
+            "move_to(",
             "print(",
             "pick_and_place",
             "pick_place",
@@ -1197,6 +1311,35 @@ def _object_vector_gripper_mm(
             except (TypeError, ValueError):
                 continue
     return None
+
+
+def _scene_has_detected_operated_object(
+    scene_state: dict[str, Any] | None,
+    atomic_info: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(scene_state, dict):
+        return False
+    operated = str(
+        (atomic_info or {}).get("operated_object")
+        or (atomic_info or {}).get("source_object")
+        or ""
+    ).strip().lower()
+    if not operated:
+        return False
+    candidates: list[Any] = []
+    for key in ("objects", "wrist_objects"):
+        value = scene_state.get(key)
+        if isinstance(value, list):
+            candidates.extend(value)
+    for obj in candidates:
+        if not isinstance(obj, dict):
+            continue
+        if str(obj.get("status", "")).strip().lower() == "not_detected":
+            continue
+        label = str(obj.get("label", "")).strip().lower()
+        if label and (operated in label or label in operated):
+            return True
+    return False
 
 
 def _wrist_object_vector_gripper_mm(
@@ -1367,6 +1510,7 @@ def _safe_real_exec_globals(
     exec_globals: dict[str, Any] = {"__builtins__": safe_builtins}
     exec_globals.update(make_real_runtime_api(controller))
     look_context = _RuntimeLookAtContext(controller, scene_state, atomic_info, gaze_refine_fn=gaze_refine_fn)
+
     exec_globals.update(
         {
             "look_at_operated_object": look_context.look_at_operated_object,
@@ -1684,12 +1828,12 @@ def _primitive_phase_specs(atomic_info: dict[str, Any]) -> list[PrimitivePhaseSp
             (
                 "approach_object_above_and_open_gripper",
                 "approach above grasp reference and open gripper",
-                "The gripper should move to a safe pose above the operated object's grasp reference, open enough for the object, and must finish with wrist_image detecting the operated object after closed-loop gaze.",
+                "The gripper should move to a safe pose above the operated object's grasp reference and open enough for the object. If the operated object is present in scene_state, the phase should finish with wrist_image detecting it after closed-loop gaze; if YOLO did not detect the operated object, skip gaze and use task-directed axis-wise motion.",
             ),
             (
                 "descend_to_source_prepare_to_grasp",
                 "descend to grasp reference before closing",
-                "The gripper should descend slowly toward the operated object's grasp reference, remain open and aligned for grasping, avoid pushing it away, and must finish with wrist_image detecting the operated object after closed-loop gaze.",
+                "The gripper should descend toward the operated object's grasp reference, remain open and aligned for grasping, and avoid pushing it away. If the operated object is present in scene_state, the phase should finish with wrist_image detecting it after closed-loop gaze; if YOLO did not detect the operated object, skip gaze and use task-directed axis-wise motion.",
             ),
             (
                 "grasp_and_lift_to_safe_height",
@@ -1730,7 +1874,7 @@ def _primitive_phase_specs(atomic_info: dict[str, Any]) -> list[PrimitivePhaseSp
             ),
             (
                 "push_slowly",
-                "translate object in small increments",
+                "translate object in controlled motion",
                 "The correct object should move in the intended direction by the required amount while staying stable and avoiding collisions with unintended objects.",
             ),
             (
@@ -1752,7 +1896,7 @@ def _primitive_phase_specs(atomic_info: dict[str, Any]) -> list[PrimitivePhaseSp
             ),
             (
                 "pull_slowly",
-                "pull with short conservative increments",
+                "pull with controlled motion",
                 "The correct object should move in the intended pull direction by the required amount while remaining controlled and not colliding with unrelated objects.",
             ),
             (
@@ -1779,7 +1923,7 @@ def _primitive_phase_specs(atomic_info: dict[str, Any]) -> list[PrimitivePhaseSp
             ),
             (
                 "press_slowly",
-                "press along observed normal in small increments",
+                "press along observed normal",
                 "The gripper should press the correct target along its apparent normal far enough to actuate or depress it, without sliding off or striking nearby objects.",
             ),
             (
@@ -1806,7 +1950,7 @@ def _primitive_phase_specs(atomic_info: dict[str, Any]) -> list[PrimitivePhaseSp
             ),
             (
                 "articulate_slowly",
-                "move through small arc increments",
+                "move through controlled arc",
                 "The articulated object should move toward the open state through controlled increments without collision, overtravel, or loss of contact.",
             ),
             (
@@ -1833,7 +1977,7 @@ def _primitive_phase_specs(atomic_info: dict[str, Any]) -> list[PrimitivePhaseSp
             ),
             (
                 "articulate_slowly",
-                "move through small arc increments",
+                "move through controlled arc",
                 "The articulated object should move toward the closed state through controlled increments without collision, overtravel, or loss of contact.",
             ),
             (
@@ -1953,8 +2097,10 @@ def _primitive_phase_specs(atomic_info: dict[str, Any]) -> list[PrimitivePhaseSp
             "descend_to_source_prepare_to_grasp",
         }:
             success_criteria = (
-                f"{success_criteria} Closed-loop gaze is mandatory: after look_at_operated_object(), "
-                "the wrist_camera/wrist_image must detect the operated object."
+                f"{success_criteria} Closed-loop gaze is mandatory only when the operated object "
+                "is already present in scene_state/scene_state_brief; after look_at_operated_object(), "
+                "the wrist_camera/wrist_image must detect the operated object. If the operated object "
+                "is absent from scene_state, do not call look_at_operated_object()."
             )
         elif primitive != "pick_place" and index > 1:
             success_criteria = (
@@ -2019,6 +2165,7 @@ async def run_defense_agent_real_once(
     embedding_api_key: str | None,
     embedding_base_url: str | None,
     embedding_dims: int | None,
+    keypoint_database: dict[str, Any] | None = None,
     capture_images_fn: Callable[[Path, Path], None] | None = None,
     capture_observation_fn: Callable[..., dict[str, Any]] | None = None,
 ) -> RealDefenseOutputs:
@@ -2113,7 +2260,7 @@ async def run_defense_agent_real_once(
             "allowed_calls": sorted(ALLOWED_RUNTIME_CALLS),
             "allowed_builtins": sorted(ALLOWED_BUILTIN_CALLS),
             "forbidden_calls": sorted(FORBIDDEN_RUNTIME_CALLS),
-            "look_at_operated_object": "look_at_operated_object(max_angle_rad=0.35, velocity=0.035, acceleration=0.14, max_refine_steps=3); rotates gripper/wrist-camera +Z, immediately captures fresh RGB-D/YOLO perception, and repeats bounded micro-adjustments until wrist_image detects the operated object or the refine limit is reached.",
+            "look_at_operated_object": "look_at_operated_object(max_angle_rad=0.35, velocity=0.035, acceleration=0.14, max_refine_steps=3); rotates gripper/wrist-camera +Z, immediately captures fresh RGB-D/YOLO perception, and repeats bounded gaze adjustments until wrist_image detects the operated object or the refine limit is reached.",
             "move_x": "move_x(distance, velocity=0.04, acceleration=0.18); distance is millimeters in gripper/wrist-image +X.",
             "move_y": "move_y(distance, velocity=0.04, acceleration=0.18); distance is millimeters in gripper/wrist-image +Y.",
             "move_z": "move_z(distance, velocity=0.04, acceleration=0.18); distance is millimeters in gripper/wrist-image +Z.",
@@ -2216,15 +2363,16 @@ async def run_defense_agent_real_once(
     raw_judger_text = ""
     completed = True
     phase_image_roles = {
-        "global_image": "Phase-local global camera image with YOLO boxes/labels for supervisor-named task objects.",
+        "global_image": "Phase-local global camera image with YOLO boxes/labels for all detected scene objects unless --yolo-target-labels filters them.",
         "wrist_image": (
             "Phase-local wrist camera image from the gripper viewpoint with YOLO boxes/labels "
-            "for supervisor-named task objects; part of the gripper may appear along the bottom."
+            "for all detected scene objects unless --yolo-target-labels filters them; part of the gripper may appear along the bottom."
         ),
     }
 
     for atomic_index, atomic_info in enumerate(atomic_infos, start=1):
         atomic_yolo_labels = _yolo_labels_from_atomic_info(atomic_info, fallback_task=task)
+        detection_label_filter = []
         phase_specs = _primitive_phase_specs(atomic_info)
         atomic_done = False
         phase_history: list[dict[str, Any]] = []
@@ -2254,7 +2402,14 @@ async def run_defense_agent_real_once(
                 attempt_dir.mkdir(parents=True, exist_ok=True)
                 _save_json(attempt_dir / "atomic_task_info.json", atomic_info)
                 _save_json(attempt_dir / "current_phase.json", phase_spec.__dict__)
-                _save_json(attempt_dir / "yolo_detection_labels.json", {"labels": atomic_yolo_labels})
+                _save_json(
+                    attempt_dir / "yolo_detection_labels.json",
+                    {
+                        "mode": "all_scene_objects",
+                        "labels": detection_label_filter,
+                        "atomic_task_reference_labels": atomic_yolo_labels,
+                    },
+                )
 
                 coder_global = attempt_dir / f"phase_{phase_spec.index:02d}_{phase_spec.slug}_before_coder_global_rgb.png"
                 coder_wrist = attempt_dir / f"phase_{phase_spec.index:02d}_{phase_spec.slug}_before_coder_wrist_rgb.png"
@@ -2265,7 +2420,7 @@ async def run_defense_agent_real_once(
                     target_global=coder_global,
                     target_wrist=coder_wrist,
                     target_scene_state=coder_scene_state,
-                    yolo_target_labels=atomic_yolo_labels,
+                    yolo_target_labels=detection_label_filter,
                     resize_width=None,
                 )
                 latest_global = coder_global
@@ -2282,6 +2437,13 @@ async def run_defense_agent_real_once(
                     "required_phase_order": [spec.slug for spec in phase_specs],
                     "completed_phase_history": _phase_history_for_prompt(phase_history),
                 }
+                keypoint_context = _keypoint_database_for_prompt(
+                    keypoint_database or {},
+                    atomic_info,
+                    task=task,
+                )
+                operated_object_detected = _scene_has_detected_operated_object(coder_scene_payload, atomic_info)
+                _save_json(attempt_dir / "keypoint_database_context.json", keypoint_context)
                 coder_task = (
                     "DEFENSE_EI_AGENTS_REAL_PHASE_CODING\n"
                     "The real-robot code contracts are embedded below. Do not call tools; "
@@ -2301,8 +2463,14 @@ async def run_defense_agent_real_once(
                     f"{json.dumps(atomic_info, ensure_ascii=False, indent=2)}\n\n"
                     "Current phase JSON:\n"
                     f"{json.dumps(phase_context, ensure_ascii=False, indent=2)}\n\n"
+                    "Keypoint database JSON. These records are reference TCP poses and wrist "
+                    "image evidence for known grasp/place points. Use matching records to infer "
+                    "the intended grasp area and approach direction, but do not call absolute-pose "
+                    "or keypoint movement APIs. Approach using move_x/move_y/move_z "
+                    "and rotate_* commands with distances appropriate to the remaining offset:\n"
+                    f"{json.dumps(keypoint_context, ensure_ascii=False, indent=2)}\n\n"
                     "Current observation JSON:\n"
-                    f"{json.dumps({'global_image': str(latest_global), 'wrist_image': str(latest_wrist), 'global_rgb': str(latest_global), 'wrist_rgb': str(latest_wrist), 'scene_state': str(latest_scene_state) if latest_scene_state is not None else None, 'scene_state_brief': scene_state_brief(latest_scene_state_payload) if isinstance(latest_scene_state_payload, dict) else None, 'yolo_detection_labels': atomic_yolo_labels, 'image_roles': phase_image_roles}, ensure_ascii=False, indent=2)}\n\n"
+                    f"{json.dumps({'global_image': str(latest_global), 'wrist_image': str(latest_wrist), 'global_rgb': str(latest_global), 'wrist_rgb': str(latest_wrist), 'scene_state': str(latest_scene_state) if latest_scene_state is not None else None, 'scene_state_brief': scene_state_brief(latest_scene_state_payload) if isinstance(latest_scene_state_payload, dict) else None, 'operated_object_detected': operated_object_detected, 'gaze_allowed': operated_object_detected, 'yolo_detection_mode': 'all_scene_objects', 'yolo_detection_labels': detection_label_filter, 'atomic_task_reference_labels': atomic_yolo_labels, 'image_roles': phase_image_roles}, ensure_ascii=False, indent=2)}\n\n"
                     "Prior judger feedback JSON for this same phase, or null:\n"
                     f"{json.dumps(feedback, ensure_ascii=False, indent=2)}\n\n"
                     "Return exactly one fenced Python code block and nothing else."
@@ -2327,10 +2495,11 @@ async def run_defense_agent_real_once(
                         _primitive_name(atomic_info) in {"pick_place", "pick_and_place"}
                         and phase_spec.slug
                         in {"approach_object_above_and_open_gripper", "descend_to_source_prepare_to_grasp"}
+                        and operated_object_detected
                         and "look_at_operated_object" not in last_code
                     ):
                         raise ValueError(
-                            "pick_place approach phases must call look_at_operated_object() for closed-loop gaze"
+                            "pick_place approach phases must call look_at_operated_object() when the operated object is detected"
                         )
                     runtime_report = _check_generated_code(last_code)
                     syntax_report = {
@@ -2359,7 +2528,7 @@ async def run_defense_agent_real_once(
                         target_global=phase_global,
                         target_wrist=phase_wrist,
                         target_scene_state=phase_scene_state,
-                        yolo_target_labels=atomic_yolo_labels,
+                        yolo_target_labels=detection_label_filter,
                         resize_width=None,
                     )
                 else:
@@ -2397,7 +2566,7 @@ async def run_defense_agent_real_once(
                                 target_global=attempt_dir / f"{refine_stem}_global_rgb.png",
                                 target_wrist=attempt_dir / f"{refine_stem}_wrist_rgb.png",
                                 target_scene_state=attempt_dir / f"{refine_stem}_scene_state.json",
-                                yolo_target_labels=atomic_yolo_labels,
+                                yolo_target_labels=detection_label_filter,
                                 resize_width=None,
                             )
 
@@ -2414,7 +2583,7 @@ async def run_defense_agent_real_once(
                         target_global=phase_global,
                         target_wrist=phase_wrist,
                         target_scene_state=phase_scene_state,
-                        yolo_target_labels=atomic_yolo_labels,
+                        yolo_target_labels=detection_label_filter,
                         resize_width=None,
                     )
                     phase_image_width_px = _image_width_px(phase_global)
@@ -2454,7 +2623,9 @@ async def run_defense_agent_real_once(
                     "error": last_execution.get("error"),
                     "image_width_px": _image_width_px(phase_global),
                     "is_final_phase": phase_spec.index == len(phase_specs),
-                    "yolo_detection_labels": atomic_yolo_labels,
+                    "yolo_detection_mode": "all_scene_objects",
+                    "yolo_detection_labels": detection_label_filter,
+                    "atomic_task_reference_labels": atomic_yolo_labels,
                     "image_roles": phase_image_roles,
                     "completed_phase_history": _phase_history_for_prompt(phase_history),
                     "phase_start_robot_state": (
@@ -2507,17 +2678,13 @@ async def run_defense_agent_real_once(
                     }
                 phase_restore_report: dict[str, Any] | None = None
                 if not _is_success_judge(phase_judge):
-                    if isinstance(phase_start_robot_state, dict) and isinstance(
-                        phase_start_robot_state.get("joints"), list
-                    ):
-                        phase_restore_report = _restore_robot_initial_state(controller, phase_start_robot_state)
-                    else:
-                        phase_restore_report = {
-                            "ok": False,
-                            "signal": "REAL_RESTORE_PHASE_START_NO_SNAPSHOT",
-                        }
+                    phase_restore_report = {
+                        "ok": True,
+                        "signal": "REAL_RESTORE_DISABLED_AFTER_JUDGE_FAIL",
+                        "message": "Robot state was left unchanged after judger FAIL.",
+                    }
                     last_phase_restore_report = phase_restore_report
-                    _save_json(attempt_dir / "restore_phase_start_robot_state.json", phase_restore_report)
+                    _save_json(attempt_dir / "restore_disabled_after_judge_fail.json", phase_restore_report)
 
                 phase_judge_with_context = {
                     "phase_index": phase_spec.index,
@@ -2529,7 +2696,7 @@ async def run_defense_agent_real_once(
                     "scene_state": str(phase_scene_state) if phase_scene_state.exists() else None,
                     "scene_state_brief": scene_state_brief(phase_scene_payload) if phase_scene_payload else None,
                     "judge": phase_judge,
-                    "restore_phase_start_robot_state": phase_restore_report,
+                    "restore_disabled_after_judge_fail": phase_restore_report,
                 }
                 _save_json(attempt_dir / f"real_atomic_judge_phase_{phase_spec.index:02d}.json", phase_judge_with_context)
                 _save_text(attempt_dir / f"real_atomic_judge_phase_{phase_spec.index:02d}_raw.txt", raw_judger_text)
@@ -2556,8 +2723,8 @@ async def run_defense_agent_real_once(
                         if phase_start_robot_state is not None
                         else None
                     ),
-                    "restore_phase_start_robot_state": (
-                        str(attempt_dir / "restore_phase_start_robot_state.json")
+                    "restore_disabled_after_judge_fail": (
+                        str(attempt_dir / "restore_disabled_after_judge_fail.json")
                         if phase_restore_report is not None
                         else None
                     ),
@@ -2586,10 +2753,14 @@ async def run_defense_agent_real_once(
                 completed = False
                 failed_dir = log_dir / f"atomic_{atomic_index:02d}" / f"phase_{phase_spec.index:02d}_{phase_spec.slug}"
                 if last_phase_restore_report is not None:
-                    _save_json(failed_dir / "restore_phase_start_robot_state.json", last_phase_restore_report)
+                    _save_json(failed_dir / "restore_disabled_after_judge_fail.json", last_phase_restore_report)
                 else:
-                    restore_report = _restore_robot_initial_state(controller, initial_robot_state)
-                    _save_json(failed_dir / "restore_initial_robot_state.json", restore_report)
+                    restore_report = {
+                        "ok": True,
+                        "signal": "REAL_RESTORE_DISABLED_AFTER_PHASE_FAIL",
+                        "message": "Robot state was left unchanged after phase failure.",
+                    }
+                    _save_json(failed_dir / "restore_disabled_after_phase_fail.json", restore_report)
                 break
 
         atomic_done = all(
@@ -2631,6 +2802,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--coder-profile", type=Path, default=DEFAULT_CODER_PROFILE)
     parser.add_argument("--judger-profile", type=Path, default=DEFAULT_JUDGER_PROFILE)
     parser.add_argument("--log-root", type=Path, default=DEFAULT_LOG_ROOT)
+    parser.add_argument(
+        "--keypoint-database",
+        type=Path,
+        default=Path("keypoint_database.json"),
+        help="Named TCP pose database recorded by record_keypoints.py and provided to coder.",
+    )
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument(
         "--max-attempts-per-atomic",
@@ -2669,8 +2846,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--global-camera-base-transform",
         type=Path,
-        default="calibration/t_base_global_camera.json",
-        help="JSON file containing a 4x4 transform matrix T_base_global_camera.",
+        default=None,
+        help=(
+            "Optional JSON file containing a 4x4 transform matrix T_base_global_camera. "
+            "Not required: object coordinates are always reconstructed in the global camera frame."
+        ),
     )
     parser.add_argument(
         "--wrist-camera-gripper-transform",
@@ -2766,7 +2946,7 @@ async def _main_async() -> int:
     current_wrist = run_dir / "current_wrist_rgb.png"
     current_scene = run_dir / "current_scene_state.json"
     serials = [s.strip() for s in str(args.camera_serials).split(",") if s.strip()]
-    t_base_global_camera = load_transform(args.global_camera_base_transform)
+    t_base_global_camera = load_transform(args.global_camera_base_transform) if args.global_camera_base_transform else None
     t_gripper_wrist_camera = (
         load_transform(args.wrist_camera_gripper_transform)
         if args.wrist_camera_gripper_transform
@@ -2804,6 +2984,9 @@ async def _main_async() -> int:
 
     source_global = _resolve_path(args.current_global_image) if args.current_global_image else None
     source_wrist = _resolve_path(args.current_wrist_image) if args.current_wrist_image else None
+    keypoint_database_path = _resolve_path(args.keypoint_database) if args.keypoint_database else None
+    keypoint_database = _load_keypoint_database(keypoint_database_path)
+    _save_json(run_dir / "keypoint_database_loaded.json", keypoint_database)
     planner_profile = _prepare_real_profile_copy(_resolve_path(args.planner_profile), run_dir, "planner")
     supervisor_profile = _prepare_real_profile_copy(_resolve_path(args.supervisor_profile), run_dir, "supervisor")
     coder_profile = _prepare_real_profile_copy(_resolve_path(args.coder_profile), run_dir, "coder")
@@ -2946,6 +3129,7 @@ async def _main_async() -> int:
                     embedding_api_key=args.embedding_api_key,
                     embedding_base_url=args.embedding_base_url,
                     embedding_dims=args.embedding_dims,
+                    keypoint_database=keypoint_database,
                     capture_images_fn=capture_images,
                     capture_observation_fn=capture_observation,
                 )
@@ -3018,6 +3202,12 @@ async def _main_async() -> int:
             object_positions = {
                 "schema": "defense_ei_capture_only_object_positions.v1",
                 "source_scene_state": str(current_scene),
+                "coordinate_policy": {
+                    "object_coordinates": "global_camera",
+                    "tcp_pose": "base",
+                    "base_object_coordinates": "optional; present only when --global-camera-base-transform is supplied",
+                },
+                "tcp": scene_state.get("tcp"),
                 "objects": [
                     {
                         "label": obj.get("label"),
@@ -3133,6 +3323,7 @@ async def _main_async() -> int:
                 embedding_api_key=args.embedding_api_key,
                 embedding_base_url=args.embedding_base_url,
                 embedding_dims=args.embedding_dims,
+                keypoint_database=keypoint_database,
                 capture_images_fn=capture_images,
                 capture_observation_fn=capture_observation,
             )

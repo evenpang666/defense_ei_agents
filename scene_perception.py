@@ -203,18 +203,20 @@ def build_scene_state(
             perception_error = perception_error or f"wrist_yolo_failed: {exc}"
 
     return {
-        "schema": "defense_ei_scene_state.v1",
+        "schema": "defense_ei_scene_state.v2",
         "status": "ok" if global_frame is not None else "unavailable",
         "coordinate_frames": {
             "base": "UR robot base frame.",
-            "global_camera": "Fixed external RealSense camera frame.",
+            "global_camera": "Fixed external RealSense camera frame; primary object coordinate frame.",
             "gripper": "Current UR TCP/gripper frame from RTDE.",
             "wrist_camera": "Camera mounted on gripper; default transform is approximate.",
         },
         "calibration": {
             "has_t_base_global_camera": t_base_global_camera is not None,
             "has_t_gripper_wrist_camera": t_gripper_wrist_camera is not None,
-            "global_to_base_required_for_base_and_gripper_coordinates": True,
+            "global_camera_is_primary_object_frame": True,
+            "global_to_base_required_for_object_coordinates": False,
+            "base_and_gripper_object_coordinates_are_optional_derived_fields": True,
         },
         "perception": {
             "backend": backend,
@@ -225,6 +227,11 @@ def build_scene_state(
             "error": perception_error,
         },
         "tcp_pose_base": _round_list(tcp_pose_base, 6),
+        "tcp": {
+            "pose_base": _round_list(tcp_pose_base, 6),
+            "position_base_m": _round_list(tcp_pose_base[:3], 6) if tcp_pose_base else None,
+            "rotation_vector_base_rad": _round_list(tcp_pose_base[3:6], 6) if tcp_pose_base else None,
+        },
         "t_base_gripper": _round_matrix(t_base_gripper, 6),
         "t_base_global_camera": _round_matrix(t_base_global_camera, 6),
         "t_gripper_wrist_camera": _round_matrix(t_gripper_wrist_camera, 6),
@@ -248,9 +255,13 @@ def scene_state_brief(scene_state: dict[str, Any], *, max_objects: int = 8) -> d
                 "label": obj.get("label"),
                 "status": obj.get("status"),
                 "confidence": obj.get("confidence"),
+                "bbox_px": obj.get("bbox_px"),
+                "center_global_camera_m": obj.get("center_global_camera_m"),
+                "grasp_region_center_global_camera_m": obj.get("grasp_region_center_global_camera_m"),
                 "center_base_m": obj.get("center_base_m"),
                 "center_gripper_mm": obj.get("center_gripper_mm"),
                 "grasp_region_center_gripper_mm": obj.get("grasp_region_center_gripper_mm"),
+                "point_cloud": obj.get("point_cloud"),
             }
         )
     wrist_objects = []
@@ -270,6 +281,7 @@ def scene_state_brief(scene_state: dict[str, Any], *, max_objects: int = 8) -> d
         "status": scene_state.get("status"),
         "calibration": scene_state.get("calibration"),
         "perception": scene_state.get("perception"),
+        "tcp": scene_state.get("tcp"),
         "objects": objects,
         "wrist_objects": wrist_objects,
     }
